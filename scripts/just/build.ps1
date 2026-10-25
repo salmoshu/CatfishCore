@@ -24,12 +24,12 @@ $force = $Flags -contains "--force" -or $Flags -contains "-f"
 
 if ($Mode -eq "release") {
     Invoke-Native "just" @("_cargo", "build", "--release")
-    $binary = "target/release/aioncore.exe"
+    $binary = "target/release/catfishcore.exe"
     $sumFile = "target/.build-sum"
     $label = "Build"
 } else {
     Invoke-Native "just" @("_cargo", "build")
-    $binary = "target/debug/aioncore.exe"
+    $binary = "target/debug/catfishcore.exe"
     $sumFile = "target/.build-debug-sum"
     $label = "Debug build"
 }

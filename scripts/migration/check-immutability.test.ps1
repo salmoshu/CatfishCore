@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $PSCommandPath
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "../..")).ProviderPath
 $script = Join-Path $repoRoot "scripts/migration/check-immutability.ps1"
-$tmpdir = Join-Path ([System.IO.Path]::GetTempPath()) ("aioncore-migration-test-" + [Guid]::NewGuid().ToString("N"))
+$tmpdir = Join-Path ([System.IO.Path]::GetTempPath()) ("catfishcore-migration-test-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $tmpdir | Out-Null
 
 function Invoke-Native {

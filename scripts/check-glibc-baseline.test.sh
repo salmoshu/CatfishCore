@@ -7,7 +7,7 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
 FAKE_OBJDUMP="${TMP_DIR}/objdump"
-FAKE_BINARY="${TMP_DIR}/aioncore"
+FAKE_BINARY="${TMP_DIR}/catfishcore"
 touch "${FAKE_BINARY}"
 
 write_fake_objdump() {

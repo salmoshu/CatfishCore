@@ -5,7 +5,7 @@ edition.workspace = true
 exclude = ["data/**"]
 
 [[bin]]
-name = "aioncore"
+name = "catfishcore"
 path = "src/main.rs"
 
 [features]

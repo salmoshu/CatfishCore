@@ -6,9 +6,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $binary = if ($Mode -eq "release") {
-    "target/release/aioncore.exe"
+    "target/release/catfishcore.exe"
 } else {
-    "target/debug/aioncore.exe"
+    "target/debug/catfishcore.exe"
 }
 
 if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
@@ -25,4 +25,4 @@ $installDir = Join-Path $cargoHome "bin"
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 
 Copy-Item -LiteralPath $binary -Destination $installDir -Force
-Write-Output "Installed aioncore.exe to $installDir"
+Write-Output "Installed catfishcore.exe to $installDir"
