@@ -69,6 +69,8 @@ pub struct Capabilities {
     /// the last value it set via `SetConfigOption{effort}` and surfaces it here so the
     /// picker highlights the active level. `None` = no effort axis / never set.
     pub current_effort: Option<String>,
+    /// Current backend-reported speed tier; None inherits the standard tier.
+    pub current_service_tier: Option<String>,
     /// NEW (007 §9.17/Addendum 9): auth methods. NON-EMPTY ⇒ this backend can
     /// raise a mid-session `Permission{kind:Auth}` and accept `AnswerAuth` →
     /// enables the `waiting_on_auth` counter path. Empty = no mid-session auth.
@@ -213,6 +215,18 @@ pub struct ModelInfo {
     pub name: String,
     pub description: Option<String>,
     pub reasoning_efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_tiers: Vec<ServiceTierInfo>,
+}
+
+/// A speed tier advertised by the agent's model catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ServiceTierInfo {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
 }
 
 /// 007 §9.10: an advertised mode (discovery, open set).

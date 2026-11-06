@@ -1,3 +1,6 @@
+#[path = "sqlite_conversation_fork.rs"]
+mod fork;
+
 use sqlx::{Row, SqlitePool};
 
 use aionui_common::{PaginatedResult, TimestampMs};
@@ -311,6 +314,19 @@ impl IConversationRepository for SqliteConversationRepository {
             .await?;
 
         Ok(user_id)
+    }
+
+    async fn create_fork_once(
+        &self,
+        seed: &crate::repository::conversation::ConversationForkSeed<'_>,
+    ) -> Result<bool, DbError> {
+        self.create_atomic_fork(seed).await
+    }
+
+    async fn claim_fork_continuation(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE conversations SET extra = json_set(extra, '$.fork_operation.delivery', 'claimed') WHERE user_id = ? AND id = ? AND json_extract(extra, '$.fork_operation.delivery') = 'pending'")
+            .bind(user_id).bind(id).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn create(&self, row: &ConversationRow) -> Result<(), DbError> {

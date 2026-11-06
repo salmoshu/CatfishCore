@@ -407,6 +407,7 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         | SessionEvent::Provisioning { .. }
         | SessionEvent::Rewound { .. }
         | SessionEvent::ConfigChanged { .. }
+        | SessionEvent::ConfigOptionChanged { .. }
         // Async catalog discovery (claude initialize / codex model/list response).
         // Pure UI surface — the conversation projects it to the model/mode picker;
         // the FSM never reads a catalog. No-op here (like ConfigChanged).

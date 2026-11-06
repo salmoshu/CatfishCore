@@ -27,6 +27,19 @@ pub trait IConversationRepository: Send + Sync {
     /// Inserts a new conversation row.
     async fn create(&self, row: &ConversationRow) -> Result<(), DbError>;
 
+    /// Atomically create the child, independent agent binding and context snapshot.
+    /// Returns false when the operation's deterministic child already exists.
+    async fn create_fork_once(&self, _seed: &ConversationForkSeed<'_>) -> Result<bool, DbError> {
+        Err(DbError::Init("atomic fork is not supported by this repository".into()))
+    }
+
+    /// Claim the child continuation durably before dispatch. A retry never sends it twice.
+    async fn claim_fork_continuation(&self, _user_id: &str, _id: &str) -> Result<bool, DbError> {
+        Err(DbError::Init(
+            "fork continuation claim is not supported by this repository".into(),
+        ))
+    }
+
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing for the user.
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
@@ -346,6 +359,15 @@ pub trait IConversationRepository: Send + Sync {
 }
 
 // ── Supporting types ────────────────────────────────────────────────
+
+pub struct ConversationForkSeed<'a> {
+    pub row: &'a ConversationRow,
+    pub parent_id: &'a str,
+    pub native_cursor: Option<(TimestampMs, &'a str)>,
+    pub handoff_message: Option<&'a MessageRow>,
+    pub agent_identity: Option<(&'a str, &'a str)>,
+    pub copy_assistant: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessagePageCursor {

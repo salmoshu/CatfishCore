@@ -16,7 +16,7 @@ use tokio::process::Command;
 const USER: &str = "system_default_user";
 
 fn conversation_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aioncore"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_catfishcore"));
     command.arg("conversation");
     command
 }

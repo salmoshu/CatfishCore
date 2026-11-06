@@ -97,7 +97,11 @@ pub struct AcpBuildExtra {
     pub user_id: Option<String>,
     /// Present only on a forked conversation (see [`ForkSpec`]). Consumed by
     /// the first session open when no backend session id is bound yet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_native_fork"
+    )]
     pub fork: Option<ForkSpec>,
 }
 
@@ -134,8 +138,23 @@ pub struct AionrsBuildExtra {
     /// `parent_session_id` = parent conversation id) is copied into this
     /// conversation's session id, cut at `last_turn_id` when the fork was
     /// taken mid-history (`None` = fork at HEAD).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_native_fork"
+    )]
     pub fork: Option<ForkSpec>,
+}
+
+fn deserialize_native_fork<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<ForkSpec>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        Some(value) if value.get("strategy").and_then(serde_json::Value::as_str) == Some("handoff") => Ok(None),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
 }
 
 /// ACP model information returned by the ACP backend.

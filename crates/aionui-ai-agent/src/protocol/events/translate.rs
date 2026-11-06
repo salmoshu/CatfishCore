@@ -100,6 +100,8 @@ pub(crate) fn session_notification_to_events(notif: &SessionNotification) -> Vec
                 .collect();
 
             events.push(AgentStreamEvent::Plan(PlanEventData {
+                updated_at: Some(aionui_common::now_ms()),
+                explanation: None,
                 session_id: Some(session_id),
                 entries,
             }));

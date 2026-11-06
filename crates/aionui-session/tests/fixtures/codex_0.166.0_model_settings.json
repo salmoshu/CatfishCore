@@ -1,0 +1,136 @@
+[
+  {
+    "models": [
+      {
+        "id": "gpt-6.1-sol",
+        "model": "gpt-6.1-sol",
+        "displayName": "GPT-6.1-Sol",
+        "defaultReasoningEffort": "low",
+        "supportedReasoningEfforts": [
+          {
+            "reasoningEffort": "low",
+            "description": "Fast responses with lighter reasoning"
+          },
+          {
+            "reasoningEffort": "medium",
+            "description": "Balances speed and reasoning depth for everyday tasks"
+          },
+          {
+            "reasoningEffort": "high",
+            "description": "Greater reasoning depth for complex problems"
+          },
+          {
+            "reasoningEffort": "xhigh",
+            "description": "Extra high reasoning depth for complex problems"
+          },
+          {
+            "reasoningEffort": "max",
+            "description": "Maximum reasoning depth for the hardest problems"
+          },
+          {
+            "reasoningEffort": "ultra",
+            "description": "Maximum reasoning with automatic task delegation"
+          }
+        ],
+        "serviceTiers": [
+          {
+            "id": "priority",
+            "name": "Fast",
+            "description": "2x speed, increased usage"
+          }
+        ]
+      },
+      {
+        "id": "gpt-6-astra",
+        "model": "gpt-6-astra",
+        "displayName": "GPT-6-Astra",
+        "defaultReasoningEffort": "low",
+        "supportedReasoningEfforts": [
+          {
+            "reasoningEffort": "low",
+            "description": "Fast responses with lighter reasoning"
+          },
+          {
+            "reasoningEffort": "medium",
+            "description": "Balances speed and reasoning depth for everyday tasks"
+          },
+          {
+            "reasoningEffort": "high",
+            "description": "Greater reasoning depth for complex problems"
+          },
+          {
+            "reasoningEffort": "xhigh",
+            "description": "Extra high reasoning depth for complex problems"
+          },
+          {
+            "reasoningEffort": "max",
+            "description": "Maximum reasoning depth for the hardest problems"
+          },
+          {
+            "reasoningEffort": "ultra",
+            "description": "Maximum reasoning with automatic task delegation"
+          }
+        ],
+        "serviceTiers": [
+          {
+            "id": "priority",
+            "name": "Fast",
+            "description": "2x speed, increased usage"
+          }
+        ]
+      }
+    ],
+    "codex_version": "0.166.0"
+  },
+  {
+    "started": {
+      "model": "gpt-6-astra",
+      "effort": null,
+      "serviceTier": null
+    }
+  },
+  {
+    "method": "thread/settings/updated",
+    "params": {
+      "threadSettings": {
+        "model": "gpt-6.1-sol",
+        "effort": null,
+        "serviceTier": null
+      }
+    },
+    "emittedAtMs": 1793887268140
+  },
+  {
+    "method": "thread/settings/updated",
+    "params": {
+      "threadSettings": {
+        "model": "gpt-6.1-sol",
+        "effort": "max",
+        "serviceTier": null
+      }
+    },
+    "emittedAtMs": 1793887268140
+  },
+  {
+    "method": "thread/settings/updated",
+    "params": {
+      "threadSettings": {
+        "model": "gpt-6.1-sol",
+        "effort": "max",
+        "serviceTier": "priority"
+      }
+    },
+    "emittedAtMs": 1793887268142
+  },
+  {
+    "method": "thread/settings/updated",
+    "params": {
+      "threadSettings": {
+        "model": "gpt-6.1-sol",
+        "effort": "max",
+        "serviceTier": "default"
+      }
+    },
+    "emittedAtMs": 1793887268143
+  }
+]

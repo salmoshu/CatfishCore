@@ -989,32 +989,28 @@ async fn fork_mid_history_without_anchor_is_refused_not_degraded() {
 }
 
 #[tokio::test]
-async fn fork_rejects_unbound_parent_and_unsupported_agent() {
+async fn fork_uses_handoff_for_unbound_parent_and_unsupported_native_fork() {
     let (svc, repo, acp_repo) = setup_fork().await;
-
-    // Unbound parent (never had a backend session).
-    let unbound = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
-    let m = make_message(&unbound.id, "hello", 0);
-    repo.insert_message(USER_ID, &m).await.unwrap();
-    let err = svc.fork(USER_ID, &unbound.id, fork_req(&m.id)).await.unwrap_err();
-    assert!(
-        matches!(&err, ConversationError::Busy { reason } if reason.starts_with("FORK_PARENT_UNBOUND")),
-        "got {err:?}"
-    );
-
-    // Agent without a fork declaration (qwen's seeded capabilities carry no fork key).
-    let unsupported = svc.create(USER_ID, fork_create_req("qwen")).await.unwrap();
-    acp_repo
-        .update_session_id_for_user(USER_ID, &unsupported.id, "sid-x")
-        .await
-        .unwrap();
-    let m = make_message(&unsupported.id, "hello", 0);
-    repo.insert_message(USER_ID, &m).await.unwrap();
-    let err = svc.fork(USER_ID, &unsupported.id, fork_req(&m.id)).await.unwrap_err();
-    assert!(
-        matches!(&err, ConversationError::Unprocessable { reason } if reason.starts_with("FORK_UNSUPPORTED")),
-        "got {err:?}"
-    );
+    for backend in ["claude", "qwen"] {
+        let parent = svc.create(USER_ID, fork_create_req(backend)).await.unwrap();
+        if backend == "qwen" {
+            acp_repo
+                .update_session_id_for_user(USER_ID, &parent.id, "sid-qwen")
+                .await
+                .unwrap();
+        }
+        let m = make_message(&parent.id, "Continue the requested work", 0);
+        repo.insert_message(USER_ID, &m).await.unwrap();
+        let child = svc.fork(USER_ID, &parent.id, fork_req(&m.id)).await.unwrap();
+        assert_eq!(child.extra["fork"]["strategy"], "handoff");
+        assert_eq!(child.extra["fork"]["parent_conversation_id"], parent.id);
+        assert!(child.extra["fork"].get("parent_session_id").is_none());
+        let config: aionui_api_types::AcpBuildExtra = serde_json::from_value(child.extra).unwrap();
+        assert!(
+            config.fork.is_none(),
+            "handoff lineage must not open the source session"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1263,4 +1259,208 @@ async fn get_projects_fork_capability_for_aionrs_on_detail_path() {
         Some(aionui_api_types::ForkCapabilityView { at_turn: true }),
         "detail path projects the aionrs fork capability via the builtin binding ladder"
     );
+}
+
+#[tokio::test]
+async fn fork_operation_is_durable_concurrent_and_rejects_conflicting_reuse() {
+    let (svc, repo, acp) = setup_fork().await;
+    let parent = svc.create(USER_ID, fork_create_req("codex")).await.unwrap();
+    acp.update_session_id_for_user(USER_ID, &parent.id, "source-session")
+        .await
+        .unwrap();
+    let m = make_message(&parent.id, "ship this feature", 0);
+    repo.insert_message(USER_ID, &m).await.unwrap();
+    let request = || serde_json::from_value(json!({"message_id":m.id,"operation_id":"retry-123"})).unwrap();
+    let (a, b) = tokio::join!(
+        svc.fork(USER_ID, &parent.id, request()),
+        svc.fork(USER_ID, &parent.id, request())
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_eq!(a.id, b.id);
+    let fresh_service = svc.clone();
+    let repeated = fresh_service.fork(USER_ID, &parent.id, request()).await.unwrap();
+    assert_eq!(repeated.id, a.id);
+    let messages = repo
+        .list_messages_page(
+            USER_ID,
+            &a.id,
+            &aionui_db::MessagePageParams {
+                limit: 50,
+                direction: aionui_db::MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(messages.items.len(), 1, "retry does not copy the history twice");
+    let conflict =
+        serde_json::from_value(json!({"message_id":m.id,"operation_id":"retry-123","name":"different"})).unwrap();
+    let error = svc.fork(USER_ID, &parent.id, conflict).await.unwrap_err();
+    assert!(matches!(error, ConversationError::Busy { reason } if reason.starts_with("FORK_OPERATION_CONFLICT")));
+}
+
+#[tokio::test]
+async fn fork_keeps_source_turn_and_excludes_runtime_queues_and_capabilities() {
+    let (svc, repo, acp) = setup_fork().await;
+    let runtime = Arc::new(aionui_conversation::runtime_state::ConversationRuntimeStateService::default());
+    let svc = svc.with_runtime_state(runtime.clone());
+    let mut req = fork_create_req("codex");
+    req.extra["session_id"] = json!("forbidden-old-session");
+    req.extra["runtime"] = json!({"state":"running"});
+    req.extra["capabilities"] = json!({"old":true});
+    req.extra["commandQueue"] = json!([{"content":"source queue must survive"}]);
+    let parent = svc.create(USER_ID, req).await.unwrap();
+    acp.update_session_id_for_user(USER_ID, &parent.id, "source-sid")
+        .await
+        .unwrap();
+    let m = make_message(&parent.id, "working", 0);
+    let mut m = m;
+    m.backend_turn_id = Some("backend-active-turn".into());
+    repo.insert_message(USER_ID, &m).await.unwrap();
+    let mut next = make_message(&parent.id, "still working after the click", 10);
+    next.backend_turn_id = Some("backend-active-turn".into());
+    repo.insert_message(USER_ID, &next).await.unwrap();
+    let _source_claim = runtime.try_claim_turn(&parent.id, "source-active-turn").unwrap();
+    let child = svc.fork(USER_ID, &parent.id, fork_req(&m.id)).await.unwrap();
+    assert!(
+        child.extra["fork"].get("last_turn_id").is_none(),
+        "a running turn must fork live HEAD rather than pass an in-progress lastTurnId"
+    );
+    assert_eq!(
+        runtime.active_turn_id_for(&parent.id).as_deref(),
+        Some("source-active-turn")
+    );
+    for key in ["session_id", "runtime", "capabilities", "commandQueue"] {
+        assert!(child.extra.get(key).is_none(), "{key} leaked");
+    }
+    let source = svc.get(USER_ID, &parent.id).await.unwrap();
+    assert_eq!(source.extra["commandQueue"][0]["content"], "source queue must survive");
+    let bound = acp.get_for_user(USER_ID, &child.id).await.unwrap().unwrap();
+    assert!(bound.session_id.is_none());
+    let state = acp
+        .load_runtime_state_for_user(USER_ID, &child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.current_model_id.is_none());
+    assert!(state.current_mode_id.is_none());
+}
+
+#[tokio::test]
+async fn fork_cross_agent_builds_bounded_handoff_and_fresh_target_binding() {
+    let (svc, repo, acp) = setup_fork().await;
+    let parent = svc.create(USER_ID, fork_create_req("codex")).await.unwrap();
+    let target = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
+    let target_id = acp.get_for_user(USER_ID, &target.id).await.unwrap().unwrap().agent_id;
+    acp.update_session_id_for_user(USER_ID, &parent.id, "source-codex")
+        .await
+        .unwrap();
+    let goal = make_message(&parent.id, "Implement the login screen", 0);
+    repo.insert_message(USER_ID, &goal).await.unwrap();
+    let mut plan = make_message(&parent.id, "", 10);
+    plan.r#type = "plan".into();
+    plan.position = Some("left".into());
+    plan.content = json!({"entries":[{"content":"finish login tests","status":"pending"}]}).to_string();
+    repo.insert_message(USER_ID, &plan).await.unwrap();
+    let mut change = make_message(&parent.id, "", 20);
+    change.r#type = "acp_tool_call".into();
+    change.content = json!({"name":"apply_patch","file_path":"src/Login.tsx","status":"completed"}).to_string();
+    repo.insert_message(USER_ID, &change).await.unwrap();
+    let mut result = make_message(&parent.id, "", 30);
+    result.position = Some("left".into());
+    result.content = json!({"content":"npm test: 3 tests passed. Next: finish the pending login tests."}).to_string();
+    repo.insert_message(USER_ID, &result).await.unwrap();
+    let req = serde_json::from_value(
+        json!({"message_id":result.id,"operation_id":"cross-agent","target_agent_id":target_id}),
+    )
+    .unwrap();
+    let child = svc.fork(USER_ID, &parent.id, req).await.unwrap();
+    assert_eq!(child.extra["backend"], "claude");
+    assert_eq!(child.extra["fork"]["strategy"], "handoff");
+    let config: aionui_api_types::AcpBuildExtra = serde_json::from_value(child.extra.clone()).unwrap();
+    assert!(config.fork.is_none());
+    let summary = child.extra["fork_operation"]["summary"].as_str().unwrap();
+    for expected in [
+        "Goal",
+        "Latest plan",
+        "Code changes",
+        "Test results",
+        "Next steps",
+        "login",
+        "src/Login.tsx",
+        "3 tests passed",
+    ] {
+        assert!(summary.contains(expected), "missing {expected}: {summary}");
+    }
+    assert!(summary.chars().count() < 15_000);
+    let messages = repo
+        .list_messages_page(
+            USER_ID,
+            &child.id,
+            &aionui_db::MessagePageParams {
+                limit: 50,
+                direction: aionui_db::MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(messages.items.len(), 1, "summary only, not the source transcript");
+    let binding = acp.get_for_user(USER_ID, &child.id).await.unwrap().unwrap();
+    assert_eq!(binding.agent_id, target_id);
+    assert!(binding.session_id.is_none());
+}
+
+#[tokio::test]
+async fn fork_continuation_retries_do_not_duplicate_the_task() {
+    let (svc, repo, _) = setup_fork().await;
+    let parent = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
+    let m = make_message(&parent.id, "continue work", 0);
+    repo.insert_message(USER_ID, &m).await.unwrap();
+    let req = || {
+        serde_json::from_value(json!({"message_id":m.id,"operation_id":"continue-once","continue_task":true})).unwrap()
+    };
+    let child = svc.fork(USER_ID, &parent.id, req()).await.unwrap();
+    let retried = svc.fork(USER_ID, &parent.id, req()).await.unwrap();
+    assert_eq!(child.id, retried.id);
+    let messages = repo
+        .list_messages_page(
+            USER_ID,
+            &child.id,
+            &aionui_db::MessagePageParams {
+                limit: 50,
+                direction: aionui_db::MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        messages
+            .items
+            .iter()
+            .filter(|m| m.position.as_deref() == Some("right"))
+            .count(),
+        1
+    );
+    assert!(!repo.claim_fork_continuation(USER_ID, &child.id).await.unwrap());
+    assert!(!repo.claim_fork_continuation("another-user", &child.id).await.unwrap());
+}
+
+#[tokio::test]
+async fn fork_rejects_invalid_operations_missing_targets_and_foreign_sources() {
+    let (svc, repo, _) = setup_fork().await;
+    let parent = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
+    let m = make_message(&parent.id, "hello", 0);
+    repo.insert_message(USER_ID, &m).await.unwrap();
+    let request = serde_json::from_value(json!({"message_id":m.id,"operation_id":"bad key"})).unwrap();
+    assert!(
+        matches!(svc.fork(USER_ID, &parent.id, request).await.unwrap_err(), ConversationError::BadRequest { reason } if reason.starts_with("FORK_INVALID_OPERATION"))
+    );
+    let request = serde_json::from_value(json!({"message_id":m.id,"target_agent_id":"unknown-agent"})).unwrap();
+    assert!(
+        matches!(svc.fork(USER_ID, &parent.id, request).await.unwrap_err(), ConversationError::BadRequest { reason } if reason.starts_with("FORK_TARGET_UNAVAILABLE"))
+    );
+    assert!(matches!(
+        svc.fork("another-user", &parent.id, fork_req(&m.id)).await.unwrap_err(),
+        ConversationError::NotFound { .. }
+    ));
 }

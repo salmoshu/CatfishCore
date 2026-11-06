@@ -22,7 +22,7 @@ struct Capture {
 type SharedCapture = Arc<Mutex<Option<Capture>>>;
 
 fn config_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aioncore"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_catfishcore"));
     command.arg("config");
     command
 }

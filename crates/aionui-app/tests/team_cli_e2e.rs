@@ -6,7 +6,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 fn team_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aioncore"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_catfishcore"));
     command.arg("team");
     command
 }

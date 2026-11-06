@@ -17,7 +17,7 @@ struct Capture {
 type SharedCapture = Arc<Mutex<Capture>>;
 
 fn diagnose_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aioncore"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_catfishcore"));
     command.arg("diagnose");
     command
 }

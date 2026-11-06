@@ -346,9 +346,10 @@ pub enum SessionEvent {
     /// orchestrator's local rehydrate (drop Tier-1/2 after `to_turn`, §9.9).
     Rewound { to_turn: u64 },
 
-    /// Non-optimistic mode/model switch confirm (Addendum 7 / U24). Reducer
-    /// no-op (config is orthogonal). Closes reverse-coverage B8/B9/C3: adapters
-    /// emit THIS instead of `AdapterSpecific{tag:"config"}`.
+    /// A backend-confirmed config axis such as reasoning effort or service tier.
+    /// `None` clears the axis override and restores the model's default.
+    ConfigOptionChanged { option_id: String, value: Option<String> },
+    /// Backend-confirmed mode/model selections. Config is orthogonal to turns.
     ConfigChanged {
         mode: Option<String>,
         model: Option<String>,
@@ -971,6 +972,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | Provisioning { .. }
         | Rewound { .. }
         | ConfigChanged { .. }
+        | ConfigOptionChanged { .. }
         | CatalogUpdated { .. }
         | SubagentUpdate { .. }
         | SubagentDetail { .. }
@@ -1029,6 +1031,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             | UsageDelta { .. }
             | Provisioning { .. }
             | ConfigChanged { .. }
+            | ConfigOptionChanged { .. }
             // an out-of-turn advisory the user should keep seeing in history
             | Notice { .. }
             | MessageFinalized(..) => PersistTier::Display,
@@ -1390,6 +1393,15 @@ mod additive_tests {
                 Display,
             ),
             (
+                "ConfigOptionChanged",
+                SessionEvent::ConfigOptionChanged {
+                    option_id: "service_tier".into(),
+                    value: Some("priority".into()),
+                },
+                BackendProduced,
+                Display,
+            ),
+            (
                 "MessageFinalized",
                 SessionEvent::MessageFinalized(FinalizedMessage {
                     item_id: "m".into(),
@@ -1487,14 +1499,14 @@ mod additive_tests {
             ),
         ];
 
-        // Tripwire: every SessionEvent variant must appear. 34 variants today
-        // (7 orchestration-lowered + 27 backend-produced, incl. Notice +
+        // Tripwire: every SessionEvent variant must appear. 35 variants today
+        // (7 orchestration-lowered + 28 backend-produced, incl. Notice +
         // ToolOutputDelta + TurnDiffUpdated + SessionInfo + SessionTitle +
-        // MessageLifecycle); AdapterSpecific appears twice for its raw-timing
-        // vs structured split → 35 rows. A new variant trips.
+        // MessageLifecycle + ConfigOptionChanged); AdapterSpecific appears twice
+        // for its raw-timing vs structured split → 36 rows. A new variant trips.
         assert_eq!(
             table.len(),
-            35,
+            36,
             "every SessionEvent variant (+ the AdapterSpecific timing split) must be routed here"
         );
 

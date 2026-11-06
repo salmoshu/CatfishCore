@@ -53,6 +53,7 @@ const PERM_REJECT: &str = "reject";
 /// control_request). The three accepted incoming option ids (`effort`/`reasoning_effort`/
 /// `thought_level`) all normalize to this one storage key.
 const EFFORT_CONFIG_KEY: &str = "effort";
+const SERVICE_TIER_CONFIG_KEY: &str = "service_tier";
 
 /// Resolve the reasoning-effort catalog to surface for the effort picker, mirroring the
 /// backend's `effort_is_supported` current-model precedence: the efforts of the resolved
@@ -72,6 +73,107 @@ fn resolve_current_model_efforts(models: &[aionui_session::ModelInfo], current_m
         }
     }
     union
+}
+
+fn default_model_effort(models: &[ModelInfo], model: Option<&str>) -> Option<String> {
+    models
+        .iter()
+        .find(|m| Some(m.id.as_str()) == model)
+        .and_then(|m| m.default_reasoning_effort.clone())
+}
+
+fn append_speed_option(
+    options: &mut Vec<aionui_api_types::AcpConfigOptionDto>,
+    models: &[ModelInfo],
+    model: Option<&str>,
+    current: Option<String>,
+) {
+    let Some(model) = models.iter().find(|m| Some(m.id.as_str()) == model) else {
+        return;
+    };
+    if model.service_tiers.is_empty() {
+        return;
+    }
+    let mut choices = vec![aionui_api_types::AcpConfigSelectOptionDto {
+        value: "default".into(),
+        name: Some("Standard".into()),
+        label: None,
+        description: None,
+    }];
+    choices.extend(
+        model
+            .service_tiers
+            .iter()
+            .map(|tier| aionui_api_types::AcpConfigSelectOptionDto {
+                value: tier.id.clone(),
+                name: Some(tier.name.clone()),
+                label: None,
+                description: tier.description.clone(),
+            }),
+    );
+    options.push(aionui_api_types::AcpConfigOptionDto {
+        id: SERVICE_TIER_CONFIG_KEY.into(),
+        name: Some("Speed".into()),
+        label: None,
+        description: None,
+        category: Some("speed".into()),
+        option_type: "select".into(),
+        current_value: Some(current.unwrap_or_else(|| "default".into())),
+        options: choices,
+    });
+}
+
+/// Wait for the backend's speed confirmation instead of treating a pipe write as success.
+async fn apply_service_tier(backend: &dyn SessionBackend, value: &str) -> Result<(), AgentError> {
+    use futures_util::StreamExt as _;
+
+    // Subscribe before dispatch: a local agent can acknowledge in the same scheduling slice.
+    let mut events = backend.events();
+    backend
+        .dispatch(Command::SetConfigOption {
+            option_id: SERVICE_TIER_CONFIG_KEY.into(),
+            value: value.into(),
+        })
+        .await
+        .map_err(|error| AgentError::bad_request(error.to_string()))?;
+    let rejection_prefix = format!("service_tier\u{2192}{value} failed:");
+    let mut last_reported_tier = None;
+    let confirmation = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(envelope) = events.next().await {
+            match envelope.event {
+                SessionEvent::ConfigOptionChanged {
+                    option_id,
+                    value: actual,
+                } if option_id == SERVICE_TIER_CONFIG_KEY => {
+                    let actual = actual.as_deref().unwrap_or("default");
+                    if actual == value {
+                        return Ok(());
+                    }
+                    // Model/effort reconciliation can still be emitting older settings
+                    // snapshots. Only the requested tier confirms this speed change.
+                    last_reported_tier = Some(actual.to_owned());
+                }
+                SessionEvent::Notice { message, .. } if message.starts_with(&rejection_prefix) => {
+                    return Err(AgentError::bad_request(message));
+                }
+                _ => {}
+            }
+        }
+        Err(AgentError::bad_request("agent disconnected before confirming speed"))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(AgentError::bad_request(match last_reported_tier {
+            Some(actual) => format!("agent reported speed '{actual}' instead of '{value}'"),
+            None => "speed confirmation timed out".into(),
+        }))
+    });
+    if confirmation.is_ok() {
+        tracing::info!(service_tier = value, "agent confirmed speed selection");
+    } else {
+        tracing::warn!(service_tier = value, "agent did not confirm speed selection");
+    }
+    confirmation
 }
 
 /// Shared, cheaply-cloneable runtime state for a session task: the broadcast sender
@@ -109,6 +211,7 @@ struct SessionRuntime {
     /// (`get_config_options`) prefers this over the (synchronously-seeded) caps value so
     /// the observed re-read confirms the switch. `None` until the user picks a level.
     effort_override: std::sync::Mutex<Option<String>>,
+    service_tier_override: std::sync::Mutex<Option<String>>,
     /// Raw material from the last `CatalogUpdated`, kept so a later `ConfigChanged`
     /// can re-project the WHOLE options snapshot.
     ///
@@ -139,6 +242,7 @@ struct CapsFallback {
     mode: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    service_tier: Option<String>,
 }
 
 impl SessionRuntime {
@@ -184,6 +288,17 @@ impl SessionRuntime {
     }
     fn effort_override(&self) -> Option<String> {
         self.effort_override.lock().ok().and_then(|g| g.clone())
+    }
+    fn set_service_tier_override(&self, value: String) {
+        if let Ok(mut current) = self.service_tier_override.lock() {
+            *current = Some(value);
+        }
+    }
+    fn service_tier_override(&self) -> Option<String> {
+        self.service_tier_override
+            .lock()
+            .ok()
+            .and_then(|current| current.clone())
     }
     fn set_last_catalog(&self, modes: Vec<ModeInfo>, models: Vec<ModelInfo>) {
         if let Ok(mut g) = self.last_catalog.lock() {
@@ -248,6 +363,17 @@ struct CatalogPreload {
 /// `{available_models:[{id,label,reasoning_efforts?}]}`. Rows written before
 /// that field existed simply have none, so a stale catalog degrades to "no
 /// effort axis" rather than failing to parse.
+fn persisted_model_entry<'a>(
+    available_models: Option<&'a serde_json::Value>,
+    model_id: &str,
+) -> Option<&'a serde_json::Value> {
+    available_models?
+        .get("available_models")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("id").and_then(serde_json::Value::as_str) == Some(model_id))
+}
+
 fn efforts_for_model(available_models: Option<&serde_json::Value>, model_id: &str) -> Vec<String> {
     let Some(list) = available_models
         .and_then(|v| v.get("available_models"))
@@ -289,6 +415,21 @@ impl CatalogPreload {
                         // Read straight from the stored JSON: the ACP
                         // `SessionModelState` this comes from has no effort
                         // axis, so the parser cannot carry it through.
+                        default_reasoning_effort: persisted_model_entry(
+                            handshake.available_models.as_ref(),
+                            &m.model_id.to_string(),
+                        )
+                        .and_then(|entry| entry.get("default_reasoning_effort"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                        service_tiers: persisted_model_entry(
+                            handshake.available_models.as_ref(),
+                            &m.model_id.to_string(),
+                        )
+                        .and_then(|entry| entry.get("service_tiers"))
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default(),
                         reasoning_efforts: efforts_for_model(
                             handshake.available_models.as_ref(),
                             &m.model_id.to_string(),
@@ -492,6 +633,7 @@ impl SessionAgentTask {
             mode_override: std::sync::Mutex::new(None),
             model_override: std::sync::Mutex::new(None),
             effort_override: std::sync::Mutex::new(None),
+            service_tier_override: std::sync::Mutex::new(None),
             last_catalog: std::sync::Mutex::new(None),
             caps_fallback: std::sync::Mutex::new(CapsFallback::default()),
         });
@@ -978,6 +1120,7 @@ impl SessionAgentTask {
             mode: current_mode.clone(),
             model: current_model.clone(),
             effort: self.backend.capabilities().current_effort,
+            service_tier: self.backend.capabilities().current_service_tier,
         });
         // Same reason, for the catalog itself: a later confirmation has to re-project the
         // WHOLE snapshot, and the pump can only do that from a catalog it was handed.
@@ -1046,7 +1189,11 @@ impl SessionAgentTask {
                 description: None,
                 category: Some("thought_level".into()),
                 option_type: "select".into(),
-                current_value: self.runtime.effort_override().or(caps.current_effort),
+                current_value: self
+                    .runtime
+                    .effort_override()
+                    .or(caps.current_effort)
+                    .or_else(|| default_model_effort(&models, effective_model.as_deref())),
                 options: efforts
                     .iter()
                     .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
@@ -1058,6 +1205,15 @@ impl SessionAgentTask {
                     .collect(),
             });
         }
+        append_speed_option(
+            &mut config_options,
+            &models,
+            effective_model.as_deref(),
+            // Native capabilities are updated before the event pump drains its queue.
+            // A queued older snapshot must not shadow the CLI's confirmed selection.
+            caps.current_service_tier
+                .or_else(|| self.runtime.service_tier_override()),
+        );
         Ok(aionui_api_types::GetConfigOptionsResponse { config_options })
     }
 
@@ -1067,6 +1223,18 @@ impl SessionAgentTask {
         option_id: &str,
         value: &str,
     ) -> Result<aionui_api_types::SetConfigOptionResponse, AgentError> {
+        if option_id == SERVICE_TIER_CONFIG_KEY {
+            let snapshot = self.get_config_options().await?;
+            if !snapshot
+                .config_options
+                .iter()
+                .any(|option| option.id == option_id && option.options.iter().any(|choice| choice.value == value))
+            {
+                return Err(AgentError::bad_request(format!(
+                    "service tier '{value}' is not one of the available speeds"
+                )));
+            }
+        }
         // Validate a runtime mode/model switch against the advertised catalog BEFORE
         // dispatch — the ACP `clear_invalid_desired_*` semantic, but as REJECT+report
         // (not silent-drop) since this is an explicit user action at the single runtime
@@ -1114,10 +1282,14 @@ impl SessionAgentTask {
                 value: value.to_string(),
             },
         };
-        self.backend
-            .dispatch(cmd)
-            .await
-            .map_err(|e| AgentError::bad_request(e.to_string()))?;
+        if option_id == SERVICE_TIER_CONFIG_KEY {
+            apply_service_tier(self.backend.as_ref(), value).await?;
+        } else {
+            self.backend
+                .dispatch(cmd)
+                .await
+                .map_err(|e| AgentError::bad_request(e.to_string()))?;
+        }
         // Where does this switch actually land? Asked of the LIVE backend rather than
         // assumed, because the answer moves: claude queues a control frame raised
         // mid-turn but writes an idle one straight out, so the same backend answers
@@ -1162,7 +1334,11 @@ impl SessionAgentTask {
                 // the ONLY place the choice is durably recorded. Backend already accepted
                 // + validated it (dispatch above); best-effort persist (a DB failure must
                 // not fail the switch the CLI already applied).
-                self.persist_effort(value).await;
+                self.persist_config_selection(EFFORT_CONFIG_KEY, value).await;
+            }
+            SERVICE_TIER_CONFIG_KEY => {
+                self.runtime.set_service_tier_override(value.to_owned());
+                self.persist_config_selection(SERVICE_TIER_CONFIG_KEY, value).await;
             }
             _ => {
                 return Ok(aionui_api_types::SetConfigOptionResponse {
@@ -1209,7 +1385,7 @@ impl SessionAgentTask {
     /// future config key is preserved. Best-effort: a repo miss/failure is logged, not
     /// propagated — the backend already applied the effort, and losing only the
     /// persistence (not the live switch) is the safe degradation. No-op without a repo.
-    async fn persist_effort(&self, value: &str) {
+    async fn persist_config_selection(&self, key: &str, value: &str) {
         let Some(repo) = self.session_repo.as_ref() else {
             return;
         };
@@ -1229,7 +1405,7 @@ impl SessionAgentTask {
                 return;
             }
         };
-        selections.insert(EFFORT_CONFIG_KEY.to_owned(), value.to_owned());
+        selections.insert(key.to_owned(), value.to_owned());
         let json = match serde_json::to_string(&selections) {
             Ok(j) => j,
             Err(err) => {
@@ -1245,7 +1421,7 @@ impl SessionAgentTask {
             .save_runtime_state_for_user(&self.user_id, &self.conversation_id, &params)
             .await
         {
-            tracing::warn!(conversation_id = %self.conversation_id, error = %err, "persist_effort: save_runtime_state failed");
+            tracing::warn!(conversation_id = %self.conversation_id, option_id = key, error = %err, "save config selection failed");
         }
     }
 
@@ -2053,6 +2229,13 @@ pub async fn build_session_instance(
     // carried from the new-conversation screen all along and nothing ever read
     // it, so an effort chosen before the first turn was dropped.
     let persisted_effort = resolved_effort(config, session_snapshot);
+    let persisted_service_tier = session_snapshot.and_then(|snapshot| {
+        snapshot
+            .config_selections
+            .iter()
+            .find(|(key, _)| key.as_str() == SERVICE_TIER_CONFIG_KEY)
+            .map(|(_, value)| value.as_str().to_owned())
+    });
 
     // DEV (`--dump-prompts`): dump the resolved SessionConfig BEFORE it moves
     // into open_session. Best-effort — a failure only warns, never fails open.
@@ -2092,8 +2275,8 @@ pub async fn build_session_instance(
         }
     }
 
-    let backend = connection
-        .open_session(spec, session_config)
+    let mut backend = connection
+        .open_session(spec, session_config.clone())
         .await
         .map_err(|e| match e {
             // #410 parity: a missing/non-directory workspace keeps its dedicated
@@ -2112,7 +2295,7 @@ pub async fn build_session_instance(
     // is discovered) and drops it if unsupported — the same clear_invalid_desired_*
     // semantics as the codex model/mode reconcile. Best-effort: a dispatch failure must
     // not fail the open (the session is usable; only the persisted effort is lost).
-    if let Some(effort) = persisted_effort {
+    if let Some(effort) = &persisted_effort {
         if let Err(e) = backend
             .dispatch(Command::SetConfigOption {
                 option_id: EFFORT_CONFIG_KEY.to_owned(),
@@ -2125,6 +2308,60 @@ pub async fn build_session_instance(
             tracing::info!(conv_id = %conversation_id, effort = %effort, "session-port: re-applied persisted reasoning effort after open");
         }
     }
+
+    let restored_service_tier = if let Some(tier) = persisted_service_tier {
+        match apply_service_tier(backend.as_ref(), &tier).await {
+            Ok(()) => Some(tier),
+            Err(error)
+                if backend_label == "codex"
+                    && aionui_session::is_unrecoverable_resume_error(&aionui_session::ErrorReason::Backend {
+                        api_error_status: None,
+                        message: error.to_string(),
+                    }) =>
+            {
+                // An empty Codex thread has no rollout to resume. Rebuild only after
+                // the native missing-thread rejection, preserving the saved settings.
+                tracing::warn!(conv_id = %conversation_id, "speed restore found a dead Codex thread; rebuilding fresh");
+                if let Some(repo) = acp_session_repo.as_ref()
+                    && let Err(error) = repo.clear_session_id_for_user(&user_id, &conversation_id).await
+                {
+                    tracing::warn!(conv_id = %conversation_id, %error, "could not clear dead speed-restore anchor");
+                }
+                backend = connection
+                    .open_session(
+                        aionui_session::SessionSpec::Fresh {
+                            session_id: conversation_id.clone(),
+                        },
+                        session_config,
+                    )
+                    .await
+                    .map_err(|error| AgentError::bad_gateway(format!("reopen Codex session: {error}")))?;
+                if let Some(effort) = &persisted_effort
+                    && let Err(error) = backend
+                        .dispatch(Command::SetConfigOption {
+                            option_id: EFFORT_CONFIG_KEY.into(),
+                            value: effort.clone(),
+                        })
+                        .await
+                {
+                    tracing::warn!(conv_id = %conversation_id, %error, "could not restore effort on the fresh Codex thread");
+                }
+                match apply_service_tier(backend.as_ref(), &tier).await {
+                    Ok(()) => Some(tier),
+                    Err(error) => {
+                        tracing::warn!(conv_id = %conversation_id, %error, "could not restore speed on the fresh Codex thread");
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(conv_id = %conversation_id, %error, "could not restore service tier");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // GAP #7 (G5): project the backend's discovered catalog back into agent_metadata
     // so the cold-start picker stays fresh. Best-effort, detached, off the open path.
@@ -2152,6 +2389,9 @@ pub async fn build_session_instance(
         // already stopped listening — the claude case (usage rides `result`).
         Some(broadcaster),
     );
+    if let Some(tier) = restored_service_tier {
+        task.runtime.set_service_tier_override(tier);
+    }
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
 
@@ -2486,6 +2726,8 @@ fn catalog_partial_from_caps(caps: &aionui_session::Capabilities) -> Option<aion
                 if !m.reasoning_efforts.is_empty() {
                     entry["reasoning_efforts"] = serde_json::json!(m.reasoning_efforts);
                 }
+                entry["default_reasoning_effort"] = serde_json::json!(m.default_reasoning_effort);
+                entry["service_tiers"] = serde_json::json!(m.service_tiers);
                 entry
             }).collect::<Vec<_>>(),
             "current_model_id": caps.current_model,
@@ -2666,7 +2908,15 @@ fn emit_config_options_snapshot(modes: &[ModeInfo], models: &[ModelInfo], runtim
             description: None,
             category: Some("thought_level".into()),
             option_type: "select".into(),
-            current_value: runtime.effort_override().or_else(|| fallback.effort.clone()),
+            current_value: runtime
+                .effort_override()
+                .or_else(|| fallback.effort.clone())
+                .or_else(|| {
+                    default_model_effort(
+                        models,
+                        runtime.model_override().as_deref().or(fallback.model.as_deref()),
+                    )
+                }),
             options: efforts
                 .iter()
                 .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
@@ -2678,6 +2928,12 @@ fn emit_config_options_snapshot(modes: &[ModeInfo], models: &[ModelInfo], runtim
                 .collect(),
         });
     }
+    append_speed_option(
+        &mut config_options,
+        models,
+        runtime.model_override().as_deref().or(fallback.model.as_deref()),
+        runtime.service_tier_override().or(fallback.service_tier),
+    );
     // No categories → nothing to re-project; a spurious empty-snapshot frame would only
     // clobber the frontend's picker.
     if !config_options.is_empty()
@@ -3004,6 +3260,23 @@ fn spawn_event_pump(
                 }
                 // Nothing to re-project until a catalog has landed. The override is still
                 // updated, so the next REST read reports the confirmed value.
+                if let Some((modes, models)) = runtime.last_catalog() {
+                    emit_config_options_snapshot(&modes, &models, &runtime);
+                }
+            }
+
+            if let SessionEvent::ConfigOptionChanged { option_id, value } = &env.event {
+                match option_id.as_str() {
+                    "reasoning_effort" => {
+                        if let Ok(mut effort) = runtime.effort_override.lock() {
+                            *effort = value.clone();
+                        }
+                    }
+                    SERVICE_TIER_CONFIG_KEY => {
+                        runtime.set_service_tier_override(value.clone().unwrap_or_else(|| "default".into()))
+                    }
+                    _ => {}
+                }
                 if let Some((modes, models)) = runtime.last_catalog() {
                     emit_config_options_snapshot(&modes, &models, &runtime);
                 }
@@ -4487,7 +4760,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // (`pending`/`in_progress`/`completed`). Our `PlanStatus` serializes PascalCase,
         // so map it to the frontend contract explicitly rather than serde-dumping the
         // struct (a raw dump would send `Completed` and the card would never tick).
-        SessionEvent::Plan { entries, .. } => {
+        SessionEvent::Plan { entries, explanation } => {
             let entries: Vec<serde_json::Value> = entries
                 .iter()
                 .map(|e| {
@@ -4496,11 +4769,22 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                         aionui_session::PlanStatus::InProgress => "in_progress",
                         aionui_session::PlanStatus::Completed => "completed",
                     };
-                    serde_json::json!({ "content": e.content, "status": status })
+                    let priority = e.priority.map(|p| match p {
+                        aionui_session::PlanPriority::High => "high",
+                        aionui_session::PlanPriority::Medium => "medium",
+                        aionui_session::PlanPriority::Low => "low",
+                    });
+                    let mut entry = serde_json::json!({ "content": e.content, "status": status });
+                    if let Some(priority) = priority {
+                        entry["priority"] = serde_json::json!(priority);
+                    }
+                    entry
                 })
                 .collect();
             vec![AgentStreamEvent::Plan(
                 crate::protocol::events::session_updates::PlanEventData {
+                    updated_at: Some(aionui_common::now_ms()),
+                    explanation,
                     session_id: None,
                     entries,
                 },
@@ -5293,6 +5577,7 @@ mod build_mapping_tests {
                 name: "Opus".into(),
                 description: None,
                 reasoning_efforts: Vec::new(),
+                ..Default::default()
             }],
             current_model: Some("opus".into()),
             slash_commands: vec![SlashCommandInfo {
@@ -5781,7 +6066,7 @@ mod translate_tests {
                     PlanEntry {
                         content: "step one".into(),
                         status: PlanStatus::Completed,
-                        priority: None,
+                        priority: Some(aionui_session::PlanPriority::High),
                     },
                     PlanEntry {
                         content: "step two".into(),
@@ -5789,7 +6074,7 @@ mod translate_tests {
                         priority: None,
                     },
                 ],
-                explanation: None,
+                explanation: Some("Verify before release".into()),
             },
             "conv-1",
             false,
@@ -5805,6 +6090,9 @@ mod translate_tests {
             "status must be snake_case for the frontend"
         );
         assert_eq!(data.entries[1]["status"], "in_progress");
+        assert_eq!(data.entries[0]["priority"], "high");
+        assert_eq!(data.explanation.as_deref(), Some("Verify before release"));
+        assert!(data.updated_at.is_some_and(|time| time > 0));
     }
 
     // A user-cancelled turn must NOT surface an error Tips (claude reports the
@@ -6507,12 +6795,31 @@ mod persist_tests {
                         name: "Opus".into(),
                         description: None,
                         reasoning_efforts: vec!["low".into(), "medium".into(), "high".into(), "max".into()],
+                        default_reasoning_effort: Some("medium".into()),
+                        service_tiers: vec![aionui_session::ServiceTierInfo {
+                            id: "priority".into(),
+                            name: "Fast".into(),
+                            description: None,
+                        }],
+                    },
+                    ModelInfo {
+                        id: "sol".into(),
+                        name: "Sol".into(),
+                        reasoning_efforts: vec!["low".into(), "max".into()],
+                        default_reasoning_effort: Some("low".into()),
+                        service_tiers: vec![aionui_session::ServiceTierInfo {
+                            id: "priority".into(),
+                            name: "Fast".into(),
+                            description: None,
+                        }],
+                        ..Default::default()
                     },
                     ModelInfo {
                         id: "haiku".into(),
                         name: "Haiku".into(),
                         description: None,
                         reasoning_efforts: vec![],
+                        ..Default::default()
                     },
                 ],
                 current_model: Some("opus".into()),
@@ -6581,6 +6888,7 @@ mod persist_tests {
                         name: "Haiku".into(),
                         description: None,
                         reasoning_efforts: vec![],
+                        ..Default::default()
                     }],
                     current_model: Some("haiku".into()),
                     ..Default::default()
@@ -6636,6 +6944,211 @@ mod persist_tests {
             effort.current_value.as_deref(),
             Some("high"),
             "the requested level is highlighted"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_effort_is_visible_before_an_explicit_thinking_selection() {
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "default-effort".into(),
+            "user-1".into(),
+            "/w".into(),
+            Arc::new(EffortCapsBackend),
+            None,
+        );
+        let snapshot = task.get_config_options().await.unwrap();
+        assert_eq!(
+            snapshot
+                .config_options
+                .iter()
+                .find(|option| option.id == "reasoning_effort")
+                .unwrap()
+                .current_value
+                .as_deref(),
+            Some("medium")
+        );
+    }
+
+    struct SpeedCapsBackend {
+        tx: broadcast::Sender<SessionEnvelope>,
+        confirmation: Result<String, String>,
+        current_tier: std::sync::Mutex<Option<String>>,
+    }
+
+    impl SpeedCapsBackend {
+        fn new(confirmation: Result<&str, &str>) -> Self {
+            let (tx, _) = broadcast::channel(8);
+            Self {
+                tx,
+                confirmation: confirmation.map(str::to_owned).map_err(str::to_owned),
+                current_tier: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for SpeedCapsBackend {
+        async fn dispatch(&self, command: Command) -> Result<CommandReceipt, BackendError> {
+            if let Command::SetConfigOption { option_id, value } = &command
+                && option_id == SERVICE_TIER_CONFIG_KEY
+            {
+                // Reproduce the older model/effort snapshot arriving before the speed
+                // update, as observed when a fresh Codex thread is initialized.
+                let _ = self.tx.send(SessionEnvelope {
+                    session_id: "speed-test".into(),
+                    turn_gen: 0,
+                    event: SessionEvent::ConfigOptionChanged {
+                        option_id: option_id.clone(),
+                        value: Some("default".into()),
+                    },
+                });
+                let event = match &self.confirmation {
+                    Ok(actual) => {
+                        *self.current_tier.lock().unwrap() = Some(actual.clone());
+                        SessionEvent::ConfigOptionChanged {
+                            option_id: option_id.clone(),
+                            value: Some(actual.clone()),
+                        }
+                    }
+                    Err(message) => SessionEvent::Notice {
+                        level: aionui_session::NoticeLevel::Warning,
+                        message: format!("service_tier\u{2192}{value} failed: {message}"),
+                        localized: None,
+                        supersedes_key: None,
+                    },
+                };
+                let _ = self.tx.send(SessionEnvelope {
+                    session_id: "speed-test".into(),
+                    turn_gen: 0,
+                    event,
+                });
+            }
+            EffortCapsBackend.dispatch(command).await
+        }
+
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::unfold(self.tx.subscribe(), |mut rx| async move {
+                rx.recv().await.ok().map(|event| (event, rx))
+            })
+            .boxed()
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            let mut caps = EffortCapsBackend.capabilities();
+            caps.current_service_tier = self.current_tier.lock().unwrap().clone();
+            caps
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_speed_preserves_model_and_effort_and_persists_the_choice() {
+        let (repo, _db) = seeded_repo().await;
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            Arc::new(SpeedCapsBackend::new(Ok("priority"))),
+            Some(repo.clone()),
+        );
+        task.set_config_option("model", "sol").await.unwrap();
+        task.set_config_option("reasoning_effort", "max").await.unwrap();
+        let snapshot = task
+            .set_config_option("service_tier", "priority")
+            .await
+            .unwrap()
+            .config_options
+            .unwrap();
+        let current = |id: &str| {
+            snapshot
+                .iter()
+                .find(|option| option.id == id)
+                .unwrap()
+                .current_value
+                .as_deref()
+        };
+        assert_eq!(
+            (current("model"), current("reasoning_effort"), current("service_tier")),
+            (Some("sol"), Some("max"), Some("priority"))
+        );
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let selections: serde_json::Value =
+            serde_json::from_str(state.config_selections_json.as_deref().unwrap()).unwrap();
+        assert_eq!(selections["effort"], "max");
+        assert_eq!(selections["service_tier"], "priority");
+        // An older notification can still be queued on the independent pump.
+        task.runtime.set_service_tier_override("default".into());
+        let snapshot = task.get_config_options().await.unwrap();
+        assert_eq!(
+            snapshot
+                .config_options
+                .iter()
+                .find(|option| option.id == "service_tier")
+                .unwrap()
+                .current_value
+                .as_deref(),
+            Some("priority")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_or_coerced_speed_is_not_reported_or_persisted_as_success() {
+        for (confirmation, expected) in [
+            (Err("fast mode unavailable"), "fast mode unavailable"),
+            (Ok("default"), "instead of 'priority'"),
+        ] {
+            let (repo, _db) = seeded_repo().await;
+            let task = SessionAgentTask::new(
+                AgentType::Acp,
+                "conv-1".into(),
+                "user-1".into(),
+                "/w".into(),
+                Arc::new(SpeedCapsBackend::new(confirmation)),
+                Some(repo.clone()),
+            );
+            let error = task.set_config_option("service_tier", "priority").await.unwrap_err();
+            assert!(matches!(error, AgentError::BadRequest(message) if message.contains(expected)));
+            let snapshot = task.get_config_options().await.unwrap();
+            assert_eq!(
+                snapshot
+                    .config_options
+                    .iter()
+                    .find(|option| option.id == "service_tier")
+                    .unwrap()
+                    .current_value
+                    .as_deref(),
+                Some("default")
+            );
+            let state = repo
+                .load_runtime_state_for_user("user-1", "conv-1")
+                .await
+                .unwrap()
+                .unwrap();
+            let selections: serde_json::Value =
+                serde_json::from_str(state.config_selections_json.as_deref().unwrap_or("{}")).unwrap();
+            assert!(selections.get("service_tier").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_speed_the_current_model_does_not_advertise() {
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "invalid-speed".into(),
+            "user-1".into(),
+            "/w".into(),
+            Arc::new(EffortCapsBackend),
+            None,
+        );
+        let error = task.set_config_option("service_tier", "unsupported").await.unwrap_err();
+        assert!(
+            matches!(error, AgentError::BadRequest(message) if message.contains("not one of the available speeds"))
         );
     }
 
@@ -7508,12 +8021,14 @@ mod pump_tests {
                     name: "Default".into(),
                     description: None,
                     reasoning_efforts: Vec::new(),
+                    ..Default::default()
                 },
                 ModelInfo {
                     id: "opus".into(),
                     name: "Opus".into(),
                     description: None,
                     reasoning_efforts: Vec::new(),
+                    ..Default::default()
                 },
             ],
             modes: vec![ModeInfo {
@@ -7588,6 +8103,7 @@ mod pump_tests {
                     name: "Opus".into(),
                     description: None,
                     reasoning_efforts: Vec::new(),
+                    ..Default::default()
                 }],
                 modes: vec![
                     ModeInfo {
@@ -7700,6 +8216,7 @@ mod pump_tests {
                 name: "Opus".into(),
                 description: None,
                 reasoning_efforts: Vec::new(),
+                ..Default::default()
             }],
             modes: Vec::new(),
             slash_commands: Vec::new(),
@@ -9367,12 +9884,14 @@ mod pump_tests {
                         name: "Opus".into(),
                         description: None,
                         reasoning_efforts: vec![],
+                        ..Default::default()
                     },
                     ModelInfo {
                         id: "sonnet".into(),
                         name: "Sonnet".into(),
                         description: None,
                         reasoning_efforts: vec![],
+                        ..Default::default()
                     },
                 ],
                 current_model: Some("opus".into()),
@@ -9436,6 +9955,7 @@ mod pump_tests {
                     name: "Opus".into(),
                     description: None,
                     reasoning_efforts: vec!["low".into(), "high".into()],
+                    ..Default::default()
                 }],
                 current_model: Some("opus".into()),
                 // The user never picked this explicitly — it is what the CLI reported.
@@ -9569,6 +10089,7 @@ mod pump_tests {
                 name: "Opus".into(),
                 description: None,
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                ..Default::default()
             }],
         );
         emit_config_options_snapshot(
@@ -9582,6 +10103,7 @@ mod pump_tests {
                 name: "Opus".into(),
                 description: None,
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                ..Default::default()
             }],
             task.runtime_for_test(),
         );
@@ -10330,6 +10852,7 @@ mod cold_start_effort_tests {
                 name: "Opus".into(),
                 description: None,
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                ..Default::default()
             }],
             current_model: Some("opus".into()),
             ..Default::default()
@@ -10362,6 +10885,7 @@ mod cold_start_effort_tests {
                 name: "GPT-5.6-Sol".into(),
                 description: None,
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                ..Default::default()
             }],
             current_model: Some("gpt-5.6-sol".into()),
             current_effort: Some("high".into()),
@@ -10395,6 +10919,7 @@ mod cold_start_effort_tests {
                 name: "gemini-3.6-flash-low".into(),
                 description: None,
                 reasoning_efforts: Vec::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -10422,6 +10947,7 @@ mod cold_start_effort_tests {
                 name: "gemini-3.6-flash-low".into(),
                 description: None,
                 reasoning_efforts: Vec::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -10490,6 +11016,7 @@ mod catalog_writeback_tests {
                     name: "gemini-3.6-flash-high".into(),
                     description: None,
                     reasoning_efforts: Vec::new(),
+                    ..Default::default()
                 }]
             } else {
                 Vec::new()

@@ -51,6 +51,7 @@ pub(crate) fn parse_agy_models(stdout: &str) -> Vec<ModelInfo> {
                 description: None,
                 // Deliberately empty — see the module docs.
                 reasoning_efforts: Vec::new(),
+                ..Default::default()
             })
         })
         .collect()

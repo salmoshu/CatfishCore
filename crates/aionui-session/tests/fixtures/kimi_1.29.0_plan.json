@@ -1,0 +1,91 @@
+{
+  "provenance": {
+    "package": "kimi-cli",
+    "version": "1.29.0",
+    "source": "kimi_cli/acp/session.py:ACPSession._send_plan_update",
+    "capture": "Official adapter invoked with TodoDisplayBlock; no model call or hand-authored wire frames."
+  },
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "kimi-plan-fixture",
+        "update": {
+          "entries": [
+            {
+              "content": "Inspect workspace",
+              "priority": "medium",
+              "status": "in_progress"
+            },
+            {
+              "content": "Implement fix",
+              "priority": "medium",
+              "status": "pending"
+            },
+            {
+              "content": "Run tests",
+              "priority": "medium",
+              "status": "pending"
+            }
+          ],
+          "sessionUpdate": "plan"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "kimi-plan-fixture",
+        "update": {
+          "entries": [
+            {
+              "content": "Inspect workspace",
+              "priority": "medium",
+              "status": "completed"
+            },
+            {
+              "content": "Implement fix",
+              "priority": "medium",
+              "status": "in_progress"
+            },
+            {
+              "content": "Run tests",
+              "priority": "medium",
+              "status": "pending"
+            }
+          ],
+          "sessionUpdate": "plan"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "kimi-plan-fixture",
+        "update": {
+          "entries": [
+            {
+              "content": "Inspect workspace",
+              "priority": "medium",
+              "status": "completed"
+            },
+            {
+              "content": "Implement fix",
+              "priority": "medium",
+              "status": "completed"
+            },
+            {
+              "content": "Run tests",
+              "priority": "medium",
+              "status": "completed"
+            }
+          ],
+          "sessionUpdate": "plan"
+        }
+      }
+    }
+  ]
+}

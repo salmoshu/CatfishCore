@@ -27,6 +27,10 @@ pub struct ThinkingEventData {
 /// Data for the `Plan` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanEventData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]

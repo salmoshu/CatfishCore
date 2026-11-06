@@ -286,6 +286,7 @@ pub fn acp_capabilities() -> Capabilities {
         current_model: None,
         current_mode: None,
         current_effort: None,
+        current_service_tier: None,
         auth_methods: Vec::new(),
         // 009 R2: ACP is one session/prompt at a time — no proactive next-turn
         // input path from the conv layer. can_queue degrades to false (= can_send).
@@ -1420,6 +1421,7 @@ async fn handle_open_response(
                 name,
                 description,
                 reasoning_efforts: Vec::new(),
+                ..Default::default()
             })
             .collect();
         if disc.current_model.is_none() {
@@ -1509,6 +1511,7 @@ fn parse_models(models: &Value) -> Vec<ModelInfo> {
                         name: m.get("name").and_then(Value::as_str).unwrap_or(id).to_string(),
                         description: m.get("description").and_then(Value::as_str).map(str::to_string),
                         reasoning_efforts: Vec::new(),
+                        ..Default::default()
                     })
                 })
                 .collect()
@@ -3925,6 +3928,34 @@ mod tests {
                 assert!(explanation.is_none(), "ACP plan carries no explanation");
             }
             other => panic!("expected one Plan event, got {other:?}"),
+        }
+    }
+
+    /// Captured from kimi-cli 1.29.0's official ACP adapter:
+    /// tests/fixtures/kimi_1.29.0_plan.json (provenance includes the source method).
+    #[tokio::test]
+    async fn kimi_official_adapter_plan_snapshots_preserve_progress() {
+        use crate::event::{PlanPriority, PlanStatus};
+        let fixture: Value = serde_json::from_str(include_str!("../../tests/fixtures/kimi_1.29.0_plan.json")).unwrap();
+        let current_model = Arc::new(Mutex::new(None));
+        let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
+        for (index, frame) in fixture["frames"].as_array().unwrap().iter().enumerate() {
+            let events = map_update(&frame["params"], &current_model, &discovered).await;
+            let [SessionEvent::Plan { entries, explanation }] = events.as_slice() else {
+                panic!("expected Kimi plan snapshot: {events:?}")
+            };
+            assert_eq!(entries.len(), 3);
+            assert_eq!(entries[0].content, "Inspect workspace");
+            assert!(entries.iter().all(|entry| entry.priority == Some(PlanPriority::Medium)));
+            assert!(explanation.is_none());
+            let completed = entries
+                .iter()
+                .filter(|entry| entry.status == PlanStatus::Completed)
+                .count();
+            assert_eq!(completed, [0, 1, 3][index]);
+            if index < 2 {
+                assert_eq!(entries[index].status, PlanStatus::InProgress);
+            }
         }
     }
 

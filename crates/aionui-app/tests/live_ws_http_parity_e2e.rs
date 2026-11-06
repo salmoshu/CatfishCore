@@ -76,7 +76,7 @@ async fn start_live_app_on(db: aionui_db::Database, create_user: bool) -> LiveAp
     let services = AppServices::from_config_with_backend_binary_path(
         db,
         &config,
-        std::path::PathBuf::from(env!("CARGO_BIN_EXE_aioncore")),
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_catfishcore")),
     )
     .await
     .unwrap();

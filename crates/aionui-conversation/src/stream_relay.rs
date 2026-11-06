@@ -2562,11 +2562,15 @@ mod tests {
         let rx = tx.subscribe();
 
         tx.send(AgentStreamEvent::Plan(PlanEventData {
+            updated_at: Some(aionui_common::now_ms()),
+            explanation: None,
             session_id: None,
             entries: vec![json!({"content": "step one", "status": "pending"})],
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Plan(PlanEventData {
+            updated_at: Some(aionui_common::now_ms()),
+            explanation: None,
             session_id: None,
             entries: vec![json!({"content": "step one", "status": "completed"})],
         }))

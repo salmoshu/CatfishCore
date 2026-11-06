@@ -1747,6 +1747,7 @@ mod tests {
                 name: "gemini-3.1-pro-high".into(),
                 description: None,
                 reasoning_efforts: Vec::new(),
+                ..Default::default()
             }])),
             slash_commands: Vec::new(),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
@@ -1894,6 +1895,7 @@ mod tests {
                         name: (*id).to_owned(),
                         description: None,
                         reasoning_efforts: Vec::new(),
+                        ..Default::default()
                     })
                     .collect(),
             )),
@@ -2037,6 +2039,7 @@ mod tests {
             name: "gemini-3.1-pro-low".into(),
             description: None,
             reasoning_efforts: Vec::new(),
+            ..Default::default()
         }]);
         let cached = cached_models().expect("a non-empty list must be cached");
         assert!(cached.iter().any(|m| m.id == "gemini-3.1-pro-low"));

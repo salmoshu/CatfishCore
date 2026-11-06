@@ -340,6 +340,11 @@ async fn await_codex_catalog(
 async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String) {
     let catalog = await_codex_catalog(backend, |d| d.models.iter().map(|m| m.id.clone()).collect()).await;
 
+    if backend.current_model.lock().await.as_deref() != Some(requested.as_str()) {
+        tracing::info!("codex model reconcile: a newer model selection superseded the startup value");
+        return;
+    }
+
     if catalog.is_empty() {
         // Never learned the catalog → cannot validate. Leave codex on its launch
         // default (the safe choice) rather than bind a possibly-invalid model.
@@ -721,6 +726,7 @@ pub fn codex_capabilities() -> Capabilities {
         current_model: None,
         current_mode: None,
         current_effort: None,
+        current_service_tier: None,
         auth_methods: vec!["chatgptAuthTokens".into(), "refresh".into()],
         // B5 (mid-turn interjection Task 4): the conversation layer now routes a
         // mid-turn send to Command::Steer (turn/steer soft injection), so a
@@ -963,6 +969,9 @@ enum DiscoveryKind {
 /// Per-session handshake-discovered capability lists (B-CODEX-MODEL-LIST).
 #[derive(Default, Clone)]
 struct Discovered {
+    current_model: Option<String>,
+    current_effort: Option<String>,
+    current_service_tier: Option<String>,
     models: Vec<crate::capability::ModelInfo>,
     /// For codex this holds the fixed permission-tier mode enum mapped from
     /// `permissionProfile/list` (feature 012), NOT collaborationMode.
@@ -1634,6 +1643,7 @@ async fn reader_task(
     // wait so an unfollowed systemError still terminates the turn.
     let mut system_error_pending = false;
     let mut system_error_deadline: Option<tokio::time::Instant> = None;
+    let mut proposed_plans = HashMap::<String, String>::new();
 
     let mut lines = BufReader::new(stdout).lines();
     // Unbounded mid-turn read (AGENTS.md §"出了问题必须查到根因": NO mid-turn
@@ -1876,7 +1886,18 @@ async fn reader_task(
                             }
                             continue;
                         }
-                        for ev in map_notification(m, params) {
+                        if m == "thread/settings/updated"
+                            && let Some(settings) = params.get("threadSettings")
+                        {
+                            let mut disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
+                            disc.current_model = settings.get("model").and_then(Value::as_str).map(str::to_owned);
+                            disc.current_effort = settings.get("effort").and_then(Value::as_str).map(str::to_owned);
+                            disc.current_service_tier =
+                                settings.get("serviceTier").and_then(Value::as_str).map(str::to_owned);
+                        }
+                        let events = map_proposed_plan(m, params, &mut proposed_plans)
+                            .unwrap_or_else(|| map_notification(m, params));
+                        for ev in events {
                             emit(&event_tx, &session_id, cur, scope_notice_to_turn(ev, cur));
                         }
                     }
@@ -1891,6 +1912,19 @@ async fn reader_task(
                         // never a silent drop. Other responses (settings/rollback/etc)
                         // flow via notifications; diagnostic only.
                         if let Some(rid) = frame.get("id").and_then(Value::as_u64) {
+                            // Verified: Codex 0.166.0 v2/ThreadStartResponse.json.
+                            // Fresh/resumed thread responses report their actual defaults.
+                            if let Some(result) = frame.get("result")
+                                && result.get("thread").is_some()
+                                && let Some(model) = result.get("model").and_then(Value::as_str)
+                            {
+                                let mut disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
+                                disc.current_model = Some(model.to_owned());
+                                disc.current_effort =
+                                    result.get("reasoningEffort").and_then(Value::as_str).map(str::to_owned);
+                                disc.current_service_tier =
+                                    result.get("serviceTier").and_then(Value::as_str).map(str::to_owned);
+                            }
                             let error_message = frame.get("error").map(|e| {
                                 e.get("message")
                                     .and_then(Value::as_str)
@@ -2413,6 +2447,31 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
                                 id,
                                 name: m.get("displayName").and_then(Value::as_str).unwrap_or("").to_string(),
                                 description: m.get("description").and_then(Value::as_str).map(str::to_string),
+                                // Verified: Codex 0.166.0 generated v2/ModelListResponse.json
+                                // and the recorded model/settings capture.
+                                default_reasoning_effort: m
+                                    .get("defaultReasoningEffort")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                service_tiers: m
+                                    .get("serviceTiers")
+                                    .and_then(Value::as_array)
+                                    .map(|tiers| {
+                                        tiers
+                                            .iter()
+                                            .filter_map(|tier| {
+                                                Some(crate::capability::ServiceTierInfo {
+                                                    id: tier.get("id")?.as_str()?.to_owned(),
+                                                    name: tier.get("name")?.as_str()?.to_owned(),
+                                                    description: tier
+                                                        .get("description")
+                                                        .and_then(Value::as_str)
+                                                        .map(str::to_owned),
+                                                })
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
                                 reasoning_efforts: m
                                     .get("supportedReasoningEfforts")
                                     .and_then(Value::as_array)
@@ -2863,7 +2922,16 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 // uses (`:workspace`→`auto`), so the picker highlights the matching entry;
                 // a custom profile keeps its colon (matches its verbatim catalog entry).
                 .map(codex_perm::profile_id_to_legacy_value);
-            vec![SessionEvent::ConfigChanged { mode, model }]
+            let mut events = vec![SessionEvent::ConfigChanged { mode, model }];
+            for (field, option_id) in [("effort", "reasoning_effort"), ("serviceTier", "service_tier")] {
+                if let Some(value) = settings.get(field) {
+                    events.push(SessionEvent::ConfigOptionChanged {
+                        option_id: option_id.to_owned(),
+                        value: value.as_str().map(str::to_owned),
+                    });
+                }
+            }
+            events
         }
         // (No `item/userMessage/delta` arm: codex never emits that method — the user
         // echo arrives as an `item/*` with item.type=="userMessage", handled by the
@@ -3001,6 +3069,51 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
             payload: params.clone(),
         }],
     }
+}
+
+/// Verified: Codex 0.167.0 self-schema v2/PlanDeltaNotification.json and ThreadItem::Plan;
+/// https://learn.chatgpt.com/docs/app-server#items. Proposed text has no step statuses.
+/// The completed item replaces accumulated deltas and must never imply task completion.
+fn map_proposed_plan(method: &str, params: &Value, plans: &mut HashMap<String, String>) -> Option<Vec<SessionEvent>> {
+    const MAX_PLAN_CHARS: usize = 64 * 1024;
+    let text = match method {
+        "turn/started" | "turn/completed" => {
+            plans.clear();
+            return None;
+        }
+        "item/plan/delta" => {
+            let id = params.get("itemId").and_then(Value::as_str)?;
+            let delta = params.get("delta").and_then(Value::as_str)?;
+            let text = plans.entry(id.to_owned()).or_default();
+            let remaining = MAX_PLAN_CHARS.saturating_sub(text.chars().count());
+            text.extend(delta.chars().take(remaining));
+            text.clone()
+        }
+        "item/started" | "item/completed" if params.pointer("/item/type").and_then(Value::as_str) == Some("plan") => {
+            let id = params.pointer("/item/id").and_then(Value::as_str)?;
+            let text: String = params
+                .pointer("/item/text")
+                .and_then(Value::as_str)?
+                .chars()
+                .take(MAX_PLAN_CHARS)
+                .collect();
+            if method == "item/completed" {
+                plans.remove(id);
+            } else {
+                plans.insert(id.to_owned(), text.clone());
+            }
+            text
+        }
+        _ => return None,
+    };
+    Some(if text.trim().is_empty() {
+        vec![]
+    } else {
+        vec![SessionEvent::Plan {
+            entries: vec![],
+            explanation: Some(text),
+        }]
+    })
 }
 
 /// Build a [`SessionEvent::Notice`] message from a codex `deprecationNotice` /
@@ -4515,6 +4628,30 @@ impl SessionBackend for CodexSessionBackend {
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
                 })
             }
+            Command::SetConfigOption { option_id, value } if option_id == "service_tier" => {
+                // Verified: tests/fixtures/codex_0.167.0_speed_settings.json:
+                // explicit "default" overrides a globally configured fast tier.
+                self.suspend
+                    .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+                    .await?;
+                let tid = self.bound_thread().await?;
+                let id = self.next_rpc_id();
+                self.pending_set
+                    .lock()
+                    .await
+                    .insert(id, format!("service_tier\u{2192}{value}"));
+                let tier = Value::String(value);
+                self.write_frame(json!({
+                    "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
+                    "params": { "threadId": tid, "serviceTier": tier }
+                }))
+                .await?;
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                })
+            }
             Command::SetConfigOption { .. } => Err(BackendError::CommandNotSupported {
                 command: "set_config_option",
             }),
@@ -4572,6 +4709,9 @@ impl SessionBackend for CodexSessionBackend {
         // fixed permission-tier mode enum, feature 012). Read-only sync lock.
         let mut caps = self.capabilities.clone();
         let disc = self.discovered.lock().unwrap_or_else(|e| e.into_inner());
+        caps.current_model = disc.current_model.clone().or(caps.current_model);
+        caps.current_effort = disc.current_effort.clone().or(caps.current_effort);
+        caps.current_service_tier = disc.current_service_tier.clone().or(caps.current_service_tier);
         if !disc.models.is_empty() {
             caps.available_models = disc.models.clone();
         }
@@ -4770,6 +4910,77 @@ mod tests {
     use crate::event::PermissionKind;
     use crate::testing::FakeAgentIo;
     use futures_util::StreamExt;
+
+    #[test]
+    fn captured_codex_catalog_preserves_default_effort_and_speed_tiers() {
+        let capture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/codex_0.166.0_model_settings.json")).unwrap();
+        let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
+        fill_discovery(
+            DiscoveryKind::Models,
+            &json!({ "data": capture[0]["models"] }),
+            &discovered,
+        );
+        let disc = discovered.lock().unwrap();
+        let sol = disc.models.iter().find(|model| model.id == "gpt-6.1-sol").unwrap();
+        assert_eq!(sol.default_reasoning_effort.as_deref(), Some("low"));
+        assert!(sol.reasoning_efforts.iter().any(|effort| effort == "max"));
+        assert_eq!(sol.service_tiers[0].id, "priority");
+    }
+
+    #[test]
+    fn captured_codex_settings_keep_model_when_effort_and_speed_change() {
+        let capture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/codex_0.166.0_model_settings.json")).unwrap();
+        for frame in capture
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|frame| frame.get("method").is_some())
+        {
+            let events = map_notification(frame["method"].as_str().unwrap(), &frame["params"]);
+            assert!(events.iter().any(|event| matches!(event, SessionEvent::ConfigChanged { model: Some(model), .. } if model == "gpt-6.1-sol")));
+            assert!(events.iter().any(|event| matches!(event, SessionEvent::ConfigOptionChanged { option_id, .. } if option_id == "reasoning_effort")));
+            assert!(events.iter().any(|event| matches!(event, SessionEvent::ConfigOptionChanged { option_id, .. } if option_id == "service_tier")));
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_thread_response_reports_its_actual_model_and_speed() {
+        let response = json!({ "id": 42, "result": { "thread": { "id": "fresh" }, "model": "gpt-6.1-sol", "reasoningEffort": null, "serviceTier": "priority" } });
+        let fake = FakeAgentIo::never_exits(format!("{response}\n").into_bytes());
+        let backend = CodexSessionBackend::build_with_io("fresh-speed", Box::new(fake)).await;
+        for _ in 0..100 {
+            if backend.capabilities().current_model.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let caps = backend.capabilities();
+        assert_eq!(caps.current_model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(caps.current_service_tier.as_deref(), Some("priority"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_speed_changes_only_the_service_tier_and_can_restore_standard() {
+        for (value, expected) in [("priority", json!("priority")), ("default", json!("default"))] {
+            let fake = fake_with_binding("speed-thread", None);
+            let captured = fake.captured_stdin();
+            let backend = CodexSessionBackend::build_with_io("codex-speed", Box::new(fake)).await;
+            backend
+                .dispatch(Command::SetConfigOption {
+                    option_id: "service_tier".into(),
+                    value: value.into(),
+                })
+                .await
+                .unwrap();
+            let written = captured_str(&captured).await;
+            let frame: Value = serde_json::from_str(written.lines().last().unwrap()).unwrap();
+            assert_eq!(frame["params"]["serviceTier"], expected);
+            assert!(frame["params"].get("model").is_none());
+            assert!(frame["params"].get("effort").is_none());
+        }
+    }
 
     /// Verified backend matrix (task-1 brief): codex MUST advertise
     /// `supports_midturn_delivery` so mid-turn UI can gate on it.
@@ -8656,6 +8867,7 @@ mod tests {
     #[tokio::test]
     async fn codex_model_reconcile_applies_valid_model() {
         let (backend, captured) = backend_with_catalog_and_binding().await;
+        *backend.current_model.lock().await = Some("openai.gpt-5.4".into());
         reconcile_codex_model(&backend, "openai.gpt-5.4".into()).await;
         let written = captured_str(&captured).await;
         assert!(
@@ -8666,6 +8878,21 @@ mod tests {
             written.contains(r#""model":"openai.gpt-5.4""#),
             "carries the requested (valid) model, got: {written}"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_preserves_a_newer_user_model_selection() {
+        let (backend, captured) = backend_with_catalog_and_binding().await;
+        backend
+            .dispatch(Command::SetModel {
+                model: "gpt-6.1-sol".into(),
+            })
+            .await
+            .unwrap();
+        let before = captured_str(&captured).await;
+        reconcile_codex_model(&backend, "openai.gpt-5.4".into()).await;
+        assert_eq!(captured_str(&captured).await, before);
+        assert_eq!(backend.current_model.lock().await.as_deref(), Some("gpt-6.1-sol"));
     }
 
     /// A requested model that is NOT in the catalog (a stale frontend picker default the
@@ -9560,6 +9787,31 @@ mod tests {
             }
             other => panic!("expected one Plan event, got {other:?}"),
         }
+    }
+
+    /// Contract pinned by Codex 0.167.0 PlanDeltaNotification and ThreadItem::Plan self-schema.
+    #[test]
+    fn proposed_plan_streams_then_replaces_with_authoritative_text() {
+        let mut plans = HashMap::new();
+        let delta = |text: &str| json!({"itemId":"proposal-1","delta":text});
+        let first = map_proposed_plan("item/plan/delta", &delta("Inspect "), &mut plans).unwrap();
+        assert!(
+            matches!(&first[..], [SessionEvent::Plan { entries, explanation: Some(text) }] if entries.is_empty() && text == "Inspect ")
+        );
+        let second = map_proposed_plan("item/plan/delta", &delta("and verify"), &mut plans).unwrap();
+        assert!(
+            matches!(&second[..], [SessionEvent::Plan { explanation: Some(text), .. }] if text == "Inspect and verify")
+        );
+        let final_item = json!({"item":{"id":"proposal-1","type":"plan","text":"Revised authoritative plan"}});
+        let final_events = map_proposed_plan("item/completed", &final_item, &mut plans).unwrap();
+        assert!(
+            matches!(&final_events[..], [SessionEvent::Plan { entries, explanation: Some(text) }] if entries.is_empty() && text == "Revised authoritative plan")
+        );
+        assert!(plans.is_empty());
+        map_proposed_plan("item/plan/delta", &delta("stale"), &mut plans);
+        map_proposed_plan("turn/started", &json!({}), &mut plans);
+        assert!(plans.is_empty());
+        assert!(map_proposed_plan("item/completed", &json!({"item":{"type":"agentMessage"}}), &mut plans).is_none());
     }
 
     /// Regression-by-rewrite (codex-500): the bound-thread handshake budget must be the

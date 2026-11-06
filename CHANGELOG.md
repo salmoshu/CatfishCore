@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.4](https://github.com/salmoshu/CatfishCore/releases/tag/v0.2.4) (2026-11-06)
+
+### Features
+
+- **conversation:** atomically fork active conversations, preserve native context or generate bounded Agent handoffs, and deduplicate creation and continuation by operation id
+- **plan:** forward snapshots before database persistence, retain explanations, priorities and revision time, and cover the official Kimi adapter output
+- **codex:** expose model-advertised speed tiers, apply Fast/Standard through `thread/settings/update`, and restore the selected tier after runtime rebuilds
+
+### Bug Fixes
+
+- **codex:** preserve a user's newer model selection when startup reconciliation completes later
+- **codex:** reflect confirmed model, reasoning effort, and speed independently, and show the model's default reasoning effort before an explicit selection
+- **catalog:** preserve reasoning defaults and speed tiers in saved model catalogs
+
 ## [0.2.2](https://github.com/iOfficeAI/AionCore/compare/v0.2.1...v0.2.2) (2026-09-09)
 
 

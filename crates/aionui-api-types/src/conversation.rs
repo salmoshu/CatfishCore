@@ -92,13 +92,22 @@ pub struct CreateConversationRequest {
 /// Forks the conversation at `message_id` (inclusive) into a NEW conversation
 /// that inherits the parent's workspace/agent/history. The backend session
 /// materializes lazily on the fork's first open (see `AcpBuildExtra.fork`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ForkConversationRequest {
     /// The fork point: a message in the parent conversation (inclusive).
     pub message_id: String,
     /// Optional name for the forked conversation; defaults to the parent's.
     #[serde(default)]
     pub name: Option<String>,
+    /// Client-generated retry key. Reusing it with a different request is rejected.
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    /// Registered agent identity; omitted for the source agent.
+    #[serde(default)]
+    pub target_agent_id: Option<String>,
+    /// Start a continuation in the child, without changing the source turn or queue.
+    #[serde(default)]
+    pub continue_task: bool,
 }
 
 /// Prompt media capability projection for one conversation, sourced from

@@ -3,7 +3,7 @@
 use tokio::process::Command;
 
 fn aioncore_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_aioncore"))
+    Command::new(env!("CARGO_BIN_EXE_catfishcore"))
 }
 
 #[tokio::test]

@@ -28,6 +28,12 @@ use crate::capability::Capabilities;
 use crate::event::SessionEvent;
 use futures_util::stream::{BoxStream, StreamExt};
 
+type PendingSpeedRequests = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>,
+    >,
+>;
+
 /// Connection-level factory for claude. Holds the injected `Spawner` (the only
 /// way to spawn — never raw `Command`, S14) + a default `SessionConfig`. claude
 /// is 1:1, so `open_session` spawns one process and returns one backend handle.
@@ -494,6 +500,7 @@ pub struct ClaudeSessionBackend {
     /// `std::sync::Mutex` (NOT tokio) so the sync reader `process_batch` closure can
     /// lock it without awaiting — mirrors `current_mode_override`.
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    pending_speed: PendingSpeedRequests,
     /// One-shot first-turn title generation (spec 2026-08-04). Shared with the
     /// reader via `reader_state`; `dispatch(Send)` records the first prompt text.
     title_gen: Arc<TitleGenState>,
@@ -758,6 +765,7 @@ struct DiscoveredCaps {
     /// for those rows). Kept private to this module — the reconcile is the only
     /// consumer today, so it does not need to ride `ModelInfo` across the seam.
     resolved_models: std::collections::HashMap<String, String>,
+    current_service_tier: Option<String>,
 }
 
 /// Session-cumulative cost ledger. claude's `result.total_cost_usd` is
@@ -806,6 +814,7 @@ struct ClaudeReaderState {
     /// `sniff_set_config_reject` can surface a rejection as a `Notice{Warning}`
     /// (shared Arc with `ClaudeSessionBackend.pending_set_config`).
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    pending_speed: PendingSpeedRequests,
     /// Session-cumulative cost ledger (see [`CostLedger`]): survives F-4 wake
     /// respawns so a new process's restarted `total_cost_usd` counter is reported
     /// as `base + raw`, never raw alone.
@@ -863,6 +872,7 @@ fn start_claude_reader(
             state.turn_in_flight,
             state.current_mode_override,
             state.pending_set_config,
+            state.pending_speed,
             state.cost_ledger,
             state.title_gen,
             state.wake_session_slot,
@@ -904,6 +914,7 @@ impl ClaudeSessionBackend {
         // #99: shared with the reader so a rejected set_config_option(effort) surfaces
         // a Notice instead of being silently dropped.
         let pending_set_config = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let pending_speed = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         // B-CLAUDE-INIT: only let the wire fill current_model when config did NOT
         // supply one (config is authoritative; the init frame is the fallback).
         let want_init_model = config.model.is_none();
@@ -967,6 +978,7 @@ impl ClaudeSessionBackend {
             turn_in_flight: turn_in_flight.clone(),
             current_mode_override: current_mode_override.clone(),
             pending_set_config: pending_set_config.clone(),
+            pending_speed: pending_speed.clone(),
             cost_ledger,
             title_gen: title_gen.clone(),
             wake_session_slot: wake.claude_session_id.clone(),
@@ -1026,6 +1038,7 @@ impl ClaudeSessionBackend {
             current_effort: Arc::new(std::sync::Mutex::new(None)),
             current_mode_override,
             pending_set_config,
+            pending_speed,
             title_gen,
             desired_model,
         }
@@ -1075,6 +1088,17 @@ impl ClaudeSessionBackend {
         // is no longer in `wake.extra_args` either. Reads the shared slot, so a
         // mid-session switch is what gets re-applied, not the open-time pick.
         self.apply_desired_model().await;
+        let tier = self
+            .discovered_caps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current_service_tier
+            .clone();
+        if let Some(tier) = tier
+            && let Err(error) = self.set_speed(&tier).await
+        {
+            tracing::warn!(session_id = %self.session_id, %error, "could not restore Claude speed after wake");
+        }
         Ok(ProcHandle::new(reader, io))
     }
 
@@ -1344,6 +1368,80 @@ impl ClaudeSessionBackend {
         }
         self.write_control_frame(&frame).await?;
         Ok(request_id)
+    }
+
+    /// Session-only overlay plus an authoritative state readback; never writes user settings.
+    async fn speed_control_request(&self, request: serde_json::Value) -> Result<serde_json::Value, BackendError> {
+        use std::sync::atomic::Ordering;
+        let request_id = format!("ctl-speed-{}", self.control_seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_speed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id.clone(), tx);
+        let result = async {
+            self.write_control_frame(&serde_json::json!({
+                "type": "control_request", "request_id": request_id, "request": request,
+            }))
+            .await?;
+            tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+                .await
+                .map_err(|_| BackendError::Transport("Claude speed confirmation timed out".into()))?
+                .map_err(|_| BackendError::Transport("Claude disconnected before confirming speed".into()))?
+                .map_err(BackendError::Transport)
+        }
+        .await;
+        self.pending_speed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_id);
+        result
+    }
+
+    async fn set_speed(&self, value: &str) -> Result<(), BackendError> {
+        // Verified: official Claude Agent SDK 0.3.318 applyFlagSettings + initialize;
+        // tests/fixtures/claude_2.1.318_speed_settings.json records the blocked-account path.
+        let fast = match value {
+            "fast" => true,
+            "default" => false,
+            _ => return Err(BackendError::Transport(format!("unsupported Claude speed '{value}'"))),
+        };
+        let previous_fast = self.capabilities().current_service_tier.as_deref() == Some("fast");
+        self.speed_control_request(serde_json::json!({
+            "subtype": "apply_flag_settings", "settings": { "fastMode": fast },
+        }))
+        .await?;
+        let state = self
+            .speed_control_request(serde_json::json!({ "subtype": "initialize" }))
+            .await?;
+        let observed = state.get("fast_mode_state").and_then(serde_json::Value::as_str);
+        if (fast && observed != Some("on")) || (!fast && observed != Some("off")) {
+            // A refused enable must not leave a latent fast preference behind.
+            if let Err(error) = self
+                .speed_control_request(serde_json::json!({
+                    "subtype": "apply_flag_settings", "settings": { "fastMode": previous_fast },
+                }))
+                .await
+            {
+                tracing::warn!(session_id = %self.session_id, %error, "could not restore previous Claude speed setting");
+            }
+            let reason = state
+                .get("fast_mode_disabled_reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("speed state not confirmed");
+            return Err(BackendError::Transport(format!(
+                "Claude fast mode unavailable: {reason}"
+            )));
+        }
+        let _ = self.event_tx.send(SessionEnvelope {
+            session_id: self.session_id.clone(),
+            turn_gen: self.turn_gen.load(std::sync::atomic::Ordering::SeqCst),
+            event: SessionEvent::ConfigOptionChanged {
+                option_id: "service_tier".into(),
+                value: Some(value.into()),
+            },
+        });
+        Ok(())
     }
 
     /// G-A: interrupt the in-flight turn — write `control_request{subtype:"interrupt"}`
@@ -1649,6 +1747,7 @@ async fn reader_task(
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
     current_mode_override: Arc<std::sync::Mutex<Option<String>>>,
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    pending_speed: PendingSpeedRequests,
     cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
     title_gen: Arc<TitleGenState>,
     wake_session_slot: Arc<std::sync::Mutex<String>>,
@@ -1737,6 +1836,7 @@ async fn reader_task(
                 // discovered_caps; capabilities() merges it on read. Done on the RAW
                 // frame (parse_chunk drops control frames to opaque).
                 sniff_control_initialize(v, &discovered_caps, &event_tx, &session_id, cur_gen);
+                resolve_speed_response(v, &pending_speed);
                 // AUTHORITATIVE mode signal (design §9.10.1 option A / README #10):
                 // claude stamps `permissionMode` on system/init AND system/status. This
                 // single inbound path confirms EVERY mode change — user-driven (a
@@ -2521,7 +2621,17 @@ fn sniff_control_initialize(
                         name: m.get("displayName").and_then(Value::as_str).unwrap_or(&id).to_string(),
                         description: m.get("description").and_then(Value::as_str).map(str::to_string),
                         reasoning_efforts,
+                        service_tiers: if m.get("supportsFastMode").and_then(Value::as_bool) == Some(true) {
+                            vec![crate::capability::ServiceTierInfo {
+                                id: "fast".into(),
+                                name: "Fast".into(),
+                                description: None,
+                            }]
+                        } else {
+                            Vec::new()
+                        },
                         id,
+                        ..Default::default()
                     })
                 })
                 .collect()
@@ -2564,6 +2674,9 @@ fn sniff_control_initialize(
         }
         if commands.is_some() {
             caps.slash_commands = parsed_commands.clone();
+        }
+        if let Some(state) = inner.get("fast_mode_state").and_then(Value::as_str) {
+            caps.current_service_tier = Some(if state == "on" { "fast" } else { "default" }.into());
         }
     }
     // Signal the async catalog arrival so the conversation re-projects the picker
@@ -2632,15 +2745,33 @@ fn sniff_mode_reject(
     });
 }
 
-/// #99: reconcile a `control_response` for an in-flight `set_config_option(effort)`.
-/// claude does NOT echo effort, so a SUCCESS is silent (`capabilities().current_effort`
-/// already tracks it optimistically) — we only claim the pending entry. A REJECTION
-/// (`control_response{subtype:"error"}` for a bad effort value) matched NO handler
-/// before (`sniff_mode_reject` hard-filters on "permission mode") and was silently
-/// dropped, so the user never learned the set failed; here we surface it as a
-/// `Notice{Warning}` carrying the label + claude's error string. Routed strictly by the
-/// `ctl-N` request_id we minted in the SetConfigOption arm, so it never disturbs the
-/// permission-mode path (a permission-mode reject has no pending_set_config entry).
+/// Resolve only the request ids registered by speed_control_request.
+fn resolve_speed_response(frame: &serde_json::Value, pending: &PendingSpeedRequests) {
+    use serde_json::Value;
+    if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+        return;
+    }
+    let Some(response) = frame.get("response") else {
+        return;
+    };
+    let Some(request_id) = response.get("request_id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(tx) = pending.lock().unwrap_or_else(|e| e.into_inner()).remove(request_id) else {
+        return;
+    };
+    let result = match response.get("subtype").and_then(Value::as_str) {
+        Some("success") => Ok(response.get("response").cloned().unwrap_or(Value::Null)),
+        _ => Err(response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Claude rejected speed settings")
+            .into()),
+    };
+    let _ = tx.send(result);
+}
+
+/// Reconcile effort updates by request id; failures remain visible as notices.
 fn sniff_set_config_reject(
     frame: &serde_json::Value,
     pending_set_config: &Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
@@ -3381,6 +3512,29 @@ impl SessionBackend for ClaudeSessionBackend {
             // mode/model (no effort field); the frontend confirms effort by re-reading
             // (get_settings). Any other option_id rejects (cap=false ↔ reject).
             Command::SetConfigOption { option_id, value } => match option_id.as_str() {
+                "service_tier" => {
+                    self.suspend
+                        .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+                        .await?;
+                    let caps = self.capabilities();
+                    if value == "fast"
+                        && let Some(model) = caps
+                            .available_models
+                            .iter()
+                            .find(|model| Some(&model.id) == caps.current_model.as_ref())
+                        && model.service_tiers.is_empty()
+                    {
+                        return Err(BackendError::Transport(
+                            "fast mode is not supported by the current model".into(),
+                        ));
+                    }
+                    self.set_speed(&value).await?;
+                    Ok(CommandReceipt {
+                        accepted: true,
+                        admission: Admission::NoTurn,
+                        turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                    })
+                }
                 "effort" | "reasoning_effort" | "thought_level" => {
                     // Validate against the current model's advertised effort catalog
                     // (`supportedEffortLevels` → `reasoning_efforts`) BEFORE sending —
@@ -3499,6 +3653,7 @@ impl SessionBackend for ClaudeSessionBackend {
         // models + slash commands). Empty until the control_response lands — a fresh
         // read sees [] (like codex pre-`model/list`); the conversation re-reads.
         let discovered = self.discovered_caps.lock().unwrap_or_else(|e| e.into_inner());
+        caps.current_service_tier = discovered.current_service_tier.clone();
         if !discovered.models.is_empty() {
             caps.available_models = discovered.models.clone();
         }
@@ -3685,6 +3840,115 @@ mod tests {
     use crate::backend::{McpServerSpec, McpTransport, SessionInit};
     use crate::testing::FakeAgentIo;
     use futures_util::StreamExt;
+
+    #[test]
+    fn captured_claude_speed_catalog_is_per_model_and_reports_the_actual_tier() {
+        let capture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/claude_2.1.318_speed_settings.json")).unwrap();
+        let discovered = Arc::new(std::sync::Mutex::new(DiscoveredCaps::default()));
+        let (tx, _rx) = broadcast::channel(8);
+        sniff_control_initialize(
+            &serde_json::json!({
+                "type": "control_response", "response": {
+                    "subtype": "success", "response": capture[0]["initialize"],
+                },
+            }),
+            &discovered,
+            &tx,
+            "s",
+            0,
+        );
+        let caps = discovered.lock().unwrap();
+        assert_eq!(caps.current_service_tier.as_deref(), Some("default"));
+        assert_eq!(
+            caps.models.iter().find(|m| m.id == "opus").unwrap().service_tiers[0].id,
+            "fast"
+        );
+        assert!(
+            caps.models
+                .iter()
+                .find(|m| m.id == "sonnet")
+                .unwrap()
+                .service_tiers
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn speed_waits_for_native_state_and_rolls_back_a_blocked_enable() {
+        use serde_json::json;
+        for (requested, observed, succeeds) in [("fast", "on", true), ("default", "off", true), ("fast", "off", false)]
+        {
+            let state = json!({ "models": [], "fast_mode_state": observed, "fast_mode_disabled_reason": "preference" });
+            let response = |id: &str, body: serde_json::Value| {
+                format!("{}\n", json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":body}})).into_bytes()
+            };
+            let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![
+                response("ctl-speed-1", serde_json::Value::Null),
+                response("ctl-speed-2", state),
+                response("ctl-speed-3", serde_json::Value::Null),
+            ]);
+            let captured = fake.captured_stdin();
+            let release = fake.segment_releaser();
+            let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+            backend.turn_in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut events = backend.events();
+            let drive = async {
+                for id in 1..=if succeeds { 2 } else { 3 } {
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while !String::from_utf8_lossy(&captured.lock().await).contains(&format!("ctl-speed-{id}")) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("control request must be written even mid-turn");
+                    release();
+                }
+            };
+            let (result, ()) = tokio::join!(
+                backend.dispatch(Command::SetConfigOption {
+                    option_id: "service_tier".into(),
+                    value: requested.into(),
+                }),
+                drive
+            );
+            if succeeds {
+                assert!(result.is_ok());
+                let confirmed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while let Some(envelope) = events.next().await {
+                        if let SessionEvent::ConfigOptionChanged { option_id, value } = envelope.event {
+                            return (option_id, value);
+                        }
+                    }
+                    panic!("speed confirmation event missing");
+                })
+                .await
+                .unwrap();
+                assert_eq!(confirmed, ("service_tier".into(), Some(requested.into())));
+            } else {
+                assert!(
+                    matches!(result, Err(BackendError::Transport(message)) if message.contains("unavailable: preference"))
+                );
+            }
+            assert_eq!(
+                backend.capabilities().current_service_tier.as_deref(),
+                Some(if observed == "on" { "fast" } else { "default" })
+            );
+            assert!(backend.pending_speed.lock().unwrap().is_empty());
+            let wire = String::from_utf8(captured.lock().await.clone()).unwrap();
+            let requests: Vec<serde_json::Value> =
+                wire.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(
+                requests[0]["request"]["settings"],
+                json!({"fastMode": requested == "fast"})
+            );
+            assert_eq!(requests[1]["request"]["subtype"], "initialize");
+            if !succeeds {
+                assert_eq!(requests[2]["request"]["settings"], json!({"fastMode": false}));
+            }
+            assert!(!wire.contains("set_model") && !wire.contains("effortLevel"));
+        }
+    }
 
     /// The seam MUST hand claude a bare valid UUID for `--session-id`/`--resume`
     /// (a non-UUID makes claude exit 1 "Invalid session ID"). A prefixed logical

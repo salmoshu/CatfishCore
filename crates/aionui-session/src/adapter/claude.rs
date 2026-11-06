@@ -1319,6 +1319,7 @@ impl BackendAdapter for ClaudeAdapter {
             current_model: None,
             current_mode: None,
             current_effort: None,
+            current_service_tier: None,
             auth_methods: Vec::new(), // no mid-session re-auth on local path
             // 009 R2: claude's persistent stdin is a FIFO — a write while a turn
             // is in flight is buffered and consumed as the next turn, so the conv
