@@ -544,7 +544,7 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::BadRequest {
                 reason: "project service unavailable; cannot resolve file attachments".to_owned(),
             })?;
-        let upload_root = std::env::temp_dir().join("aionui");
+        let upload_root = std::env::temp_dir().join("catfish");
         project
             .resolve_chat_message(user_id, content, files, &upload_root)
             .await
@@ -4376,6 +4376,95 @@ impl ConversationService {
         })
     }
 
+    pub(crate) async fn recover_empty_reply_runtime(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) {
+        use crate::runtime_state::RuntimeLifecycleState;
+        let Some(agent) = task_manager.get_task(conversation_id) else {
+            return;
+        };
+        if agent.live_background_tasks() > 0
+            || agent.get_session_key().is_none()
+            || self.runtime_state.lifecycle_for(conversation_id) != RuntimeLifecycleState::Active
+        {
+            return;
+        }
+        info!(
+            conversation_id,
+            turn_id, "Rebuilding empty-reply runtime once without replaying the user task"
+        );
+        task_manager
+            .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
+            .await;
+        if self.runtime_state.lifecycle_for(conversation_id) != RuntimeLifecycleState::Active
+            || self.runtime_state.take_deferred_cancel(conversation_id, turn_id)
+        {
+            return;
+        }
+        let result = {
+            let build = self.ensure_runtime_agent(user_id, conversation_id, task_manager, "empty_reply_recovery");
+            tokio::pin!(build);
+            loop {
+                tokio::select! {
+                    result = &mut build => break Some(result),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
+                        if self.runtime_state.lifecycle_for(conversation_id) != RuntimeLifecycleState::Active
+                            || self.runtime_state.take_deferred_cancel(conversation_id, turn_id)
+                        { break None; }
+                    }
+                }
+            }
+        };
+        let Some(result) = result else {
+            task_manager
+                .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
+                .await;
+            info!(conversation_id, turn_id, "User stop cancelled empty-reply recovery");
+            return;
+        };
+        if self.runtime_state.lifecycle_for(conversation_id) != RuntimeLifecycleState::Active
+            || self.runtime_state.take_deferred_cancel(conversation_id, turn_id)
+        {
+            task_manager
+                .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
+                .await;
+            return;
+        }
+        if let Err(error) = &result {
+            warn!(conversation_id, turn_id, error = %error, "Empty-reply runtime recovery failed");
+        }
+        let recovered = result.is_ok();
+        info!(
+            conversation_id,
+            turn_id, recovered, "Empty-reply runtime recovery finished; awaiting an explicit user retry"
+        );
+        let id = Self::mint_msg_id();
+        let row = MessageRow {
+            id: id.clone(),
+            conversation_id: conversation_id.to_owned(),
+            msg_id: Some(id),
+            r#type: "tips".to_owned(),
+            content: serde_json::json!({
+                "type": if recovered { "info" } else { "warning" },
+                "content": "",
+                "code": if recovered { "ACP_RUNTIME_RECOVERED" } else { "ACP_RUNTIME_RECOVERY_FAILED" },
+            })
+            .to_string(),
+            position: Some("left".to_owned()),
+            status: Some("finish".to_owned()),
+            hidden: false,
+            created_at: now_ms(),
+            backend_turn_id: None,
+        };
+        if let Err(error) = self.insert_raw_message(user_id, &row).await {
+            warn!(conversation_id, error = %error, "Could not persist runtime recovery result");
+        }
+    }
+
     async fn ensure_runtime_agent(
         &self,
         user_id: &str,
@@ -4408,6 +4497,10 @@ impl ConversationService {
             Ok(agent) => agent,
             Err(err) => {
                 let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref());
+                if send_error.code() == Some(aionui_api_types::AgentErrorCode::UserAgentSessionResumeFailed) {
+                    self.persist_and_broadcast_send_failure_tip(user_id, conversation_id, "", &send_error, None)
+                        .await;
+                }
                 if send_error.is_openclaw_gateway_unreachable() {
                     warn!(
                         conversation_id = %conversation_id,

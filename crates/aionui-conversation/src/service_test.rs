@@ -2027,8 +2027,10 @@ async fn create_rejects_unavailable_workspace_with_trailing_whitespace_in_reques
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
     std::fs::create_dir(&dir).unwrap();
-    let workspace = dir.join("workspace");
-    std::fs::create_dir(&workspace).unwrap();
+    // Windows resolves an existing path with a trailing space to the same
+    // directory, so use a genuinely missing target to exercise rejection on
+    // every platform without changing the expected error contract.
+    let workspace = dir.join("missing-workspace");
     let workspace_with_trailing_space = format!("{} ", workspace.to_string_lossy());
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
@@ -3875,6 +3877,7 @@ struct ScriptedAgent {
     scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
     sent_contents: Mutex<Vec<String>>,
     send_error: Option<AgentSendError>,
+    workspace_override: Option<String>,
 }
 
 impl ScriptedAgent {
@@ -3888,6 +3891,7 @@ impl ScriptedAgent {
             scripts: Mutex::new(VecDeque::from(scripts)),
             sent_contents: Mutex::new(vec![]),
             send_error: None,
+            workspace_override: None,
         }
     }
 
@@ -3903,6 +3907,11 @@ impl ScriptedAgent {
 
     fn with_send_error(mut self, error: AgentSendError) -> Self {
         self.send_error = Some(error);
+        self
+    }
+
+    fn with_workspace(mut self, workspace: &str) -> Self {
+        self.workspace_override = Some(workspace.to_owned());
         self
     }
 
@@ -3922,7 +3931,7 @@ impl IAgentTask for ScriptedAgent {
     }
 
     fn workspace(&self) -> &str {
-        "/tmp/test"
+        self.workspace_override.as_deref().unwrap_or("/tmp/test")
     }
 
     fn status(&self) -> Option<ConversationStatus> {
@@ -3963,7 +3972,11 @@ impl IAgentTask for ScriptedAgent {
     }
 }
 
-impl IMockAgent for ScriptedAgent {}
+impl IMockAgent for ScriptedAgent {
+    fn get_session_key(&self) -> Option<String> {
+        Some("sess-existing".to_owned())
+    }
+}
 
 // ── send_message tests ──────────────────────────────────────────
 
@@ -4586,6 +4599,43 @@ async fn ensure_runtime_recovers_missing_agent_and_returns_snapshot() {
     assert!(result.runtime.has_task);
     assert!(task_mgr.get_task(&conv.id).is_some());
     assert!(result.config_options.is_empty());
+}
+
+#[tokio::test]
+async fn ensure_runtime_recovery_failure_is_persisted_and_broadcast_in_chat() {
+    let (svc, broadcaster, repo, _) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(FailingBuildTaskManager::new(
+        "CODEX_SESSION_RESUME_FAILED: no rollout found for thread id original",
+    ));
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    broadcaster.take_events();
+    assert!(svc.ensure_runtime("user_1", &conv.id, &task_mgr).await.is_err());
+    let messages = repo
+        .list_messages_page(
+            "user_1",
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
+    let tip = messages
+        .iter()
+        .find(|message| message.r#type == "tips")
+        .expect("failure remains in chat history after reload");
+    let content: serde_json::Value = serde_json::from_str(&tip.content).unwrap();
+    assert_eq!(content["error"]["code"], "USER_AGENT_SESSION_RESUME_FAILED");
+    assert_eq!(content["error"]["retryable"], false);
+    assert!(
+        broadcaster
+            .take_events()
+            .iter()
+            .any(|event| event.name == "message.stream"
+                && event.data["data"]["error"]["code"] == "USER_AGENT_SESSION_RESUME_FAILED")
+    );
 }
 
 #[tokio::test]
@@ -6685,6 +6735,68 @@ async fn send_message_auto_replays_clean_retryable_acp_error_once() {
         tips.len(),
         0,
         "first clean retryable error stays hidden when replay succeeds"
+    );
+}
+
+#[tokio::test]
+async fn empty_reply_rebuilds_same_session_without_resending_the_task() {
+    let sessions = Arc::new(StubAcpSessionRepo::with_session_id("sess-existing"));
+    let (svc, bus, repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        sessions.clone(),
+    );
+    let task_mgr = Arc::new(MockTaskManagerWithWorkspace::new(&ensure_test_workspace_path()));
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let first = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![
+                AgentStreamEvent::Tips(aionui_ai_agent::protocol::events::TipsEventData {
+                    content: String::new(),
+                    tip_type: aionui_ai_agent::protocol::events::TipType::Info,
+                    code: Some("ACP_EMPTY_TURN".into()),
+                    params: Some(json!({"recovery_eligible":true})),
+                    supersedes_key: None,
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ]],
+        )
+        .with_workspace(&ensure_test_workspace_path()),
+    );
+    task_mgr
+        .agents
+        .lock()
+        .unwrap()
+        .insert(conv.id.clone(), AgentInstance::Mock(first.clone()));
+    let manager: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &manager)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+    assert_eq!(first.sent_contents(), vec!["Hello"]);
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    assert_eq!(
+        task_mgr.active_count(),
+        1,
+        "the replacement runtime stays available, messages: {messages:?}"
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.position.as_deref() == Some("right"))
+            .count(),
+        1
+    );
+    assert!(
+        messages.iter().any(|m| m.content.contains("ACP_RUNTIME_RECOVERED")),
+        "recovery result should be persisted, messages: {messages:?}"
+    );
+    assert!(
+        bus.events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.name == "message.stream" && e.data.to_string().contains("ACP_RUNTIME_RECOVERED"))
     );
 }
 

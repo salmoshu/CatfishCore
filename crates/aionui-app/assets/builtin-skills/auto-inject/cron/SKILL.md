@@ -14,19 +14,19 @@ agent-facing config CLI.
 2. Always query existing tasks before creating or updating.
 3. Do not ask for extra confirmation after the user has already requested the scheduling change.
 4. Never pass, inline, export, echo, or set any `AIONUI_...` environment variable.
-5. Commands must directly call `"$AIONUI_HELPER_BIN" config cron current ...`.
-6. Pass create and update payloads through stdin heredocs attached to the command. Do not write payload JSON files to disk.
+5. Commands must directly call the bundled helper: `"$AIONUI_HELPER_BIN" config cron current ...` in Bash, or `& $env:AIONUI_HELPER_BIN config cron current ...` in PowerShell.
+6. Pass create and update payloads directly through stdin using a Bash heredoc or a PowerShell single-quoted here-string. Do not write payload JSON files to disk. In PowerShell, set UTF-8 encoding before piping JSON, as shown below.
 7. Put `job_id` in the update JSON payload, not in a command flag.
 8. After a successful create or update, send one short final confirmation that a normal user can understand. Include the task name and schedule description. Do not show internal ids such as `cron_...`.
-9. If the CLI fails, report the failure from stderr/stdout in normal prose and do not claim the task was created.
+9. After creating or updating, query the task again and compare its name, schedule description, and message with the intended text, including non-ASCII characters and line breaks. Repair a mismatched task once by updating its existing id, then read it back again; do not create another task. If the CLI fails or the text still differs, report the failure in normal prose and do not claim success.
 
 ## Workflow
 
-1. Run `"$AIONUI_HELPER_BIN" config cron current list`.
-2. If the returned `data` array is empty, create the task with `"$AIONUI_HELPER_BIN" config cron current create <<'JSON'`.
-3. If one task exists and the user wants to change it, update that task with `"$AIONUI_HELPER_BIN" config cron current update <<'JSON'`.
+1. Run `config cron current list` through the bundled helper, using the active-shell syntax below.
+2. If the returned `data` array is empty, create the task with `config cron current create` and a stdin payload.
+3. If one task exists and the user wants to change it, update that task with `config cron current update` and a stdin payload.
 4. If a task already exists and the user is asking for a different additional task, ask how they want to handle the existing task.
-5. Report success or failure from the CLI output in normal prose, following the final confirmation rule above.
+5. Run the list command again and verify the saved task's `name`, `schedule.description`, and `target.payload.text` against the intended payload. Report success or failure in normal prose, following the final confirmation rule above.
 
 ## Payload
 
@@ -44,16 +44,18 @@ Update payload uses the same fields and also requires:
 The `message` must tell the AI exactly what to do when the task fires. It should
 not merely restate the user's scheduling request.
 
-| User says                         | Bad message              | Good message                                                                                 |
-| --------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------- |
-| "Send me hello every day at 10am" | Send me hello            | Reply with exactly: Hello!                                                                   |
-| "Remind me to drink water daily"  | Remind me to drink water | Reply with a friendly reminder to drink water.                                               |
-| "Summarize AI news every Monday"  | Summarize AI news        | Search for the latest AI news from this week and produce a concise bullet-point summary.     |
+| User says                         | Bad message              | Good message                                                                             |
+| --------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------- |
+| "Send me hello every day at 10am" | Send me hello            | Reply with exactly: Hello!                                                               |
+| "Remind me to drink water daily"  | Remind me to drink water | Reply with a friendly reminder to drink water.                                           |
+| "Summarize AI news every Monday"  | Summarize AI news        | Search for the latest AI news from this week and produce a concise bullet-point summary. |
 
 ## Examples
 
-Examples use English sample text. For real tasks, write the task name,
-schedule description, and message in the user's language.
+For real tasks, replace the sample task name, schedule description, and message
+with text in the user's language. Use the syntax for the active shell.
+
+### Bash
 
 Query:
 
@@ -87,6 +89,59 @@ Update:
 }
 JSON
 ```
+
+### PowerShell
+
+Windows PowerShell 5.1 defaults to ASCII when piping text to native programs,
+which replaces Chinese and emoji with question marks before the helper receives
+them. Set `$OutputEncoding` to UTF-8 before each create or update pipeline.
+Set `[Console]::OutputEncoding` to UTF-8 when reading the helper's JSON output.
+Repeat these settings in each new PowerShell invocation; changing the console
+code page alone does not set the pipeline encoding. Do not change shell profiles.
+
+Query:
+
+```powershell
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+& $env:AIONUI_HELPER_BIN config cron current list
+```
+
+Create only after the query returns an empty `data` array:
+
+```powershell
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+{
+  "name": "每日提醒 ✅",
+  "schedule": "0 9 * * *",
+  "schedule_description": "每天上午 9:00",
+  "message": "请回复：你好，世界！\n记得喝水。"
+}
+'@ | & $env:AIONUI_HELPER_BIN config cron current create
+```
+
+Update with the existing id returned by the query:
+
+```powershell
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+{
+  "job_id": "cron_123",
+  "name": "每日总结 ✅",
+  "schedule": "0 18 * * MON-FRI",
+  "schedule_description": "工作日下午 6:00",
+  "message": "回顾今天的会话并给出简短总结。\n保留需要继续处理的事项。"
+}
+'@ | & $env:AIONUI_HELPER_BIN config cron current update
+```
+
+Keep the closing `'@` at the start of its line. The single-quoted here-string
+keeps JSON quotes, backslashes, and literal `$` characters intact. After either
+write, run the query again and verify the saved text before confirming success.
+
+### Multiline messages
 
 Multiline message example:
 

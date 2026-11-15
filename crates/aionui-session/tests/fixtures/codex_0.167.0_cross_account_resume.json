@@ -1,0 +1,16 @@
+{
+  "binary_version": "0.167.0",
+  "selected_account_authenticated": true,
+  "creator_differs_from_selected_account": true,
+  "same_thread_id": true,
+  "separate_auth_and_history_profiles": true,
+  "turns_restored": 4,
+  "item_types_restored": {
+    "userMessage": 4,
+    "reasoning": 50,
+    "agentMessage": 8,
+    "commandExecution": 76,
+    "webSearch": 7
+  },
+  "model_requests_sent": 0
+}

@@ -96,6 +96,8 @@ pub struct TurnAttemptSummary {
     /// orchestrator reflect "needs auth" into the agent's availability even
     /// though the turn itself is not an error.
     pub needs_auth: bool,
+    /// Ordinary user request ended empty, with no terminal authentication evidence.
+    pub empty_reply: bool,
 }
 
 impl TurnAttemptSummary {
@@ -108,6 +110,7 @@ impl TurnAttemptSummary {
         self.saw_tool_or_side_effect |= other.saw_tool_or_side_effect;
         self.persisted_assistant_output |= other.persisted_assistant_output;
         self.needs_auth |= other.needs_auth;
+        self.empty_reply |= other.empty_reply;
         if other.terminal_error.is_some() {
             self.terminal_error = other.terminal_error.clone();
         }
@@ -638,8 +641,10 @@ impl StreamRelay {
                             if matches!(data.tip_type, TipType::Success) {
                                 attempt.saw_visible_output = true;
                             }
-                            if data.code.as_deref() == Some("ACP_EMPTY_TURN_NEEDS_AUTH") {
-                                attempt.needs_auth = true;
+                            if data.code.as_deref() == Some("ACP_EMPTY_TURN")
+                                && data.params.as_ref().and_then(|p| p.get("recovery_eligible")).and_then(serde_json::Value::as_bool) == Some(true)
+                            {
+                                attempt.empty_reply = true;
                             }
                             // A card that supersedes itself gets this turn's
                             // running totals before it goes anywhere, so the
@@ -1386,7 +1391,10 @@ mod tests {
             RelayTerminal::Finish,
             "needs-auth empty turn is a benign finish"
         );
-        assert!(outcome.attempt.needs_auth, "needs-auth tip must set the summary flag");
+        assert!(
+            !outcome.attempt.needs_auth,
+            "a possible login hint is not authentication evidence"
+        );
     }
 
     #[tokio::test]

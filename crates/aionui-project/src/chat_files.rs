@@ -108,7 +108,11 @@ impl ProjectService {
                 if !candidate.is_file() {
                     return Err(ProjectError::ChatFileMissing { path: path.clone() });
                 }
-                if !path_within(upload_root, candidate) {
+                // Existing drafts and history may still reference pre-0.4.29 uploads.
+                // Only the application's real managed root may use this legacy root.
+                let legacy_upload = upload_root == std::env::temp_dir().join("catfish")
+                    && path_within(&std::env::temp_dir().join("aionui"), candidate);
+                if !path_within(upload_root, candidate) && !legacy_upload {
                     return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
                 }
                 Ok(path.clone())

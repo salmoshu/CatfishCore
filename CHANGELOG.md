@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.5](https://github.com/salmoshu/CatfishCore/releases/tag/v0.2.5) (2026-11-16)
+
+### Features
+
+- **codex:** verify the 0.167.0 app-server contract and surface terminal capacity details from fatal retry frames
+- **conversation:** preserve session history, model settings, and task state when rebuilding runtimes
+
+### Bug Fixes
+
+- **codex:** request paginated thread resumes without full-history turns, and preserve authentication context across account changes
+- **codex:** preserve the final retry and capacity detail when a model remains unavailable after the retry budget
+- **runtime:** serialize ACP prompts, protect terminal lifetimes, and recover a transient empty reply without replaying the task
+
 ## [0.2.4](https://github.com/salmoshu/CatfishCore/releases/tag/v0.2.4) (2026-11-06)
 
 ### Features

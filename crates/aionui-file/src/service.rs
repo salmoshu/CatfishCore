@@ -911,7 +911,7 @@ impl crate::traits::IFileService for FileService {
         let bytes = data.to_vec();
 
         tokio::task::spawn_blocking(move || {
-            let mut dir = std::env::temp_dir().join("aionui");
+            let mut dir = std::env::temp_dir().join("catfish");
             if let Some(conv_id) = conv_id.as_deref() {
                 dir = dir.join(conv_id);
             } else {

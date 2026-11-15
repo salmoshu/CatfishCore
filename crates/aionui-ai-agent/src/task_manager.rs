@@ -316,11 +316,11 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                     return None;
                 }
 
-                // A live background container (workflow / background bash /
-                // background subagent) outlives its turn with status=Finished
-                // and emits no mid-flight frames, so idle_ms alone misreads a
-                // busy agent as idle. Killing it orphans the work and drops the
-                // CLI's completion report. Protection is logged at info: this
+                // A live background container or client-hosted terminal may
+                // outlive its turn with status=Finished. Some produce no
+                // mid-flight frames, so idle_ms alone misreads a busy agent as
+                // idle. Killing it orphans the work and drops the CLI's
+                // completion report. Protection is logged at info: this
                 // fires at most once per scan per agent and is exactly what a
                 // production "background task vanished" report needs.
                 let live_background_tasks = agent.live_background_tasks();
@@ -1008,6 +1008,49 @@ mod tests {
 
         assert!(captured.contains("reason=LiveBackgroundTask"));
         assert!(captured.contains("live_background_tasks=1"));
+    }
+
+    #[tokio::test]
+    async fn running_client_terminal_protects_finished_task_until_exit() {
+        let manager = WorkerTaskManagerImpl::new(Arc::new(|_options| {
+            async { Err(AgentError::bad_gateway("not used")) }.boxed()
+        }));
+        let registry = crate::terminal::TerminalRegistry::new("conv-terminal", None);
+        let command = if cfg!(windows) {
+            "ping -n 30 127.0.0.1"
+        } else {
+            "sleep 30"
+        };
+        let terminal_id = registry
+            .create(crate::terminal::CreateTerminalParams {
+                command: command.to_owned(),
+                args: vec![],
+                env: vec![],
+                cwd: None,
+                output_byte_limit: None,
+            })
+            .await
+            .unwrap();
+        let agent = MockAgent::new("conv-terminal", Some(ConversationStatus::Finished))
+            .with_last_activity(now_ms() - 600_000)
+            .with_live_background_tasks(registry.running_count());
+        let slot = Arc::new(OnceCell::new());
+        assert!(slot.set(managed_instance(mock_instance(agent))).is_ok());
+        manager.tasks.insert("conv-terminal".to_owned(), slot);
+
+        assert!(manager.collect_idle(300_000).is_empty());
+
+        assert!(registry.kill(&terminal_id, "test").await);
+        registry.wait_for_exit(&terminal_id).await.unwrap();
+        assert_eq!(registry.running_count(), 0);
+
+        let agent = MockAgent::new("conv-terminal", Some(ConversationStatus::Finished))
+            .with_last_activity(now_ms() - 600_000)
+            .with_live_background_tasks(registry.running_count());
+        let slot = Arc::new(OnceCell::new());
+        assert!(slot.set(managed_instance(mock_instance(agent))).is_ok());
+        manager.tasks.insert("conv-terminal".to_owned(), slot);
+        assert_eq!(manager.collect_idle(300_000), vec!["conv-terminal".to_owned()]);
     }
 
     #[test]

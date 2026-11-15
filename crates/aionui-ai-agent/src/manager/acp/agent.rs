@@ -607,7 +607,7 @@ pub struct AcpAgentManager {
     /// `exit_status` and peek stderr without going through a wrapper method.
     pub(super) process: Arc<CliAgentProcess>,
 
-    /// Mutex for serializing session operations (new/load/send).
+    /// Serializes session opening, prompts, and their terminal lifecycle events.
     session_lock: Mutex<()>,
 }
 
@@ -1261,8 +1261,12 @@ impl AcpAgentManager {
     /// 3. Already opened → noop, return the existing sid
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id))]
     async fn ensure_session_opened(&self) -> Result<String, AgentError> {
-        debug!("Ensuring ACP session is opened");
         let _lock = self.session_lock.lock().await;
+        self.ensure_session_opened_locked().await
+    }
+
+    async fn ensure_session_opened_locked(&self) -> Result<String, AgentError> {
+        debug!("Ensuring ACP session is opened");
         self.ensure_protocol_connected_for_operation("ensure_session_opened")?;
 
         let (session_id, opened) = {
@@ -1303,8 +1307,13 @@ impl AcpAgentManager {
     /// forwarded to the CLI. Each hook in the pipeline reads one-shot flags
     /// on `AcpSession` (e.g. `pending_session_new_prelude`,
     /// flags) and prepends the appropriate block when set.
+    ///
+    /// The caller holds `session_lock` until it emits the terminal event.
     async fn ensure_session_and_send(&self, data: &SendMessageData) -> Result<PromptOutcome, AcpSendFailure> {
-        let sid = self.ensure_session_opened().await.map_err(AcpSendFailure::from)?;
+        let sid = self
+            .ensure_session_opened_locked()
+            .await
+            .map_err(AcpSendFailure::from)?;
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
         let raw_user_input = data.content.clone();
         let matched_command = {
@@ -1467,6 +1476,10 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
         self.runtime.last_activity_at()
     }
 
+    fn live_background_tasks(&self) -> usize {
+        self.protocol.terminal_registry().running_count()
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.runtime.subscribe()
     }
@@ -1493,6 +1506,7 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
             "ACP send_message started"
         );
 
+        let _session_lock = self.session_lock.lock().await;
         match self.ensure_session_and_send(&data).await {
             Ok(PromptOutcome::Completed { session_id }) => {
                 info!(

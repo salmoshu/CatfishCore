@@ -358,6 +358,20 @@ impl TerminalRegistry {
         }
     }
 
+    /// Number of commands that have not reported an exit.
+    ///
+    /// If a concurrent registry mutation prevents a snapshot, report activity
+    /// rather than letting the idle scanner kill a command it cannot inspect.
+    pub fn running_count(&self) -> usize {
+        let Ok(entries) = self.entries.try_lock() else {
+            return 1;
+        };
+        entries
+            .values()
+            .filter(|entry| entry.exit_rx.borrow().is_none())
+            .count()
+    }
+
     /// Ids of all live (not yet released) terminals.
     pub async fn ids(&self) -> Vec<String> {
         self.entries.lock().await.keys().cloned().collect()
@@ -446,6 +460,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_count_tracks_exit_and_release() {
+        let reg = TerminalRegistry::new("conv-t", None);
+        let command = if cfg!(windows) {
+            "ping -n 30 127.0.0.1"
+        } else {
+            "sleep 30"
+        };
+        let id = reg.create(params(command, &[])).await.unwrap();
+        assert_eq!(reg.running_count(), 1);
+
+        assert!(reg.kill(&id, "test").await);
+        reg.wait_for_exit(&id).await.unwrap();
+        assert_eq!(reg.running_count(), 0);
+
+        let id = reg.create(params(command, &[])).await.unwrap();
+        assert_eq!(reg.running_count(), 1);
+        assert!(reg.release(&id).await);
+        assert_eq!(reg.running_count(), 0);
+    }
+
+    #[tokio::test]
     async fn unknown_terminal_id_is_none_or_false() {
         let reg = TerminalRegistry::new("conv-t", None);
         assert!(reg.output("nope").await.is_none());
@@ -492,20 +527,24 @@ mod tests {
         // process on the machine, which made this test flaky.
         let dir = tempfile::TempDir::new().unwrap();
         let reg = TerminalRegistry::new("conv-t", Some(dir.path().to_path_buf()));
-        let id = reg.create(params("pwd", &[])).await.unwrap();
+        // `cmd /C cd` is the native Windows equivalent. An external `pwd` from
+        // Git Bash can instead print a POSIX path such as `/tmp/<dir>`.
+        let command = if cfg!(windows) { "cd" } else { "pwd" };
+        let id = reg.create(params(command, &[])).await.unwrap();
         reg.wait_for_exit(&id).await.unwrap();
-        // `pwd` prints the resolved path (on macOS temp_dir lives under
-        // /var -> /private/var), so compare against the canonicalized full path
-        // rather than only the trailing directory name.
+        // The command prints the resolved path (on macOS temp_dir lives under
+        // /var -> /private/var), so compare canonicalized full paths rather
+        // than only the trailing directory name or platform-specific spelling.
         let canonical = std::fs::canonicalize(dir.path()).unwrap();
-        let expected = canonical.to_str().unwrap();
-        let snap = wait_for_output_contains(&reg, &id, expected).await;
-        assert_eq!(
-            snap.output.trim(),
-            expected,
-            "pwd should report the default cwd; output: {}",
-            snap.output
-        );
+        let directory_name = dir.path().file_name().unwrap().to_str().unwrap();
+        let snap = wait_for_output_contains(&reg, &id, directory_name).await;
+        let reported = std::fs::canonicalize(snap.output.trim()).unwrap_or_else(|error| {
+            panic!(
+                "cwd command should report a valid path; output: {:?}, error: {error}",
+                snap.output
+            )
+        });
+        assert_eq!(reported, canonical, "cwd command should report the default cwd");
     }
 
     #[tokio::test]

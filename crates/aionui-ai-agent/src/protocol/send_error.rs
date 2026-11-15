@@ -546,6 +546,17 @@ fn unknown_upstream_classification() -> ClassifiedError {
 }
 
 fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
+    if lower.contains("codex_session_resume_failed:")
+        || lower.starts_with("codex thread/resume failed:")
+        || lower.starts_with("codex rejected the turn request: thread not found:")
+    {
+        return Some(agent_error(
+            "The previous Codex session could not be restored. Its history was preserved and this request was not continued.",
+            AgentErrorCode::UserAgentSessionResumeFailed,
+            false,
+            AgentErrorResolutionKind::ReconnectAgent,
+        ));
+    }
     // codex dead resume anchor (ELECTRON-3Q0): `thread/resume` against a threadId
     // with no on-disk rollout / `turn/start` against a threadId unknown to the
     // process (verified: samples/codex-cli/0.144.1/dead_resume.jsonl). MUST
@@ -1978,16 +1989,30 @@ mod tests {
     // reopens Fresh). The generic "not found" arm previously swallowed them as
     // the non-retryable UserLlmProviderEndpointNotFound, blocking the replay.
     #[test]
-    fn classifies_codex_dead_thread_as_retryable_session_not_found() {
+    fn classifies_codex_dead_thread_as_preserved_session_recovery_failure() {
         for detail in [
             "codex rejected the turn request: thread not found: 0199-dead",
             "codex thread/resume failed: no rollout found for thread id 0199-dead",
         ] {
             let err = AgentSendError::from_agent_error(AgentError::bad_gateway(detail));
-            assert_eq!(err.code(), Some(AgentErrorCode::UserAgentSessionNotFound), "{detail}");
-            assert_eq!(err.stream_error().retryable, Some(true), "{detail}");
+            assert_eq!(
+                err.code(),
+                Some(AgentErrorCode::UserAgentSessionResumeFailed),
+                "{detail}"
+            );
+            assert_eq!(err.stream_error().retryable, Some(false), "{detail}");
             assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserAgent), "{detail}");
         }
+    }
+
+    #[test]
+    fn failed_codex_recovery_preserves_context_instead_of_triggering_a_fresh_auto_replay() {
+        let err = AgentSendError::from_agent_error(AgentError::bad_gateway(
+            "open codex session: CODEX_SESSION_RESUME_FAILED: no rollout found for thread id previous",
+        ));
+        assert_eq!(err.code(), Some(AgentErrorCode::UserAgentSessionResumeFailed));
+        assert_eq!(err.stream_error().retryable, Some(false));
+        assert!(err.stream_error().message.contains("history was preserved"));
     }
 
     #[test]

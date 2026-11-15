@@ -229,8 +229,8 @@ struct SessionRuntime {
     /// The pump needs these because a pushed frame REPLACES the frontend's whole
     /// snapshot, so every axis it re-sends overwrites the picker — including axes the
     /// user never touched, whose override is `None`. Without this the effort level went
-    /// blank on every mode confirmation. Filled by `get_config_options`, which is the one
-    /// place holding both the backend handle and the same fallback order.
+    /// blank on every mode confirmation. Filled by `prime_caps_fallback` at construction
+    /// and on every `get_config_options`, using the same backend snapshot and fallback order.
     /// Order is `override → this`, identical to REST.
     caps_fallback: std::sync::Mutex<CapsFallback>,
 }
@@ -641,15 +641,7 @@ impl SessionAgentTask {
         // stream to the pump — never a backend Arc (see `spawn_event_pump` for why
         // capturing a backend Arc there would leak the child process).
         let events = backend.events();
-        spawn_event_pump(
-            events,
-            runtime.clone(),
-            conversation_id.clone(),
-            user_id.clone(),
-            session_repo.clone(),
-            broadcaster,
-        );
-        Arc::new(Self {
+        let task = Arc::new(Self {
             agent_type,
             conversation_id,
             user_id,
@@ -660,7 +652,20 @@ impl SessionAgentTask {
             catalog_preload,
             command_seq: AtomicI64::new(0),
             prompt_dump,
-        })
+        });
+        // A task rebuilt by `send_message` after idle reclaim never goes through
+        // REST `get_config_options`. Seed the pump's fallback before any catalog
+        // event so untouched axes retain their spawn-time values.
+        task.prime_caps_fallback();
+        spawn_event_pump(
+            events,
+            task.runtime.clone(),
+            task.conversation_id.clone(),
+            task.user_id.clone(),
+            task.session_repo.clone(),
+            broadcaster,
+        );
+        task
     }
 
     fn next_command_id(&self) -> u64 {
@@ -1100,6 +1105,30 @@ impl SessionAgentTask {
         &self.runtime
     }
 
+    /// Mirror the effective catalog into the backend-Arc-free event pump. Both task
+    /// construction and REST use this path so their fallback values cannot diverge.
+    fn prime_caps_fallback(
+        &self,
+    ) -> (
+        Vec<aionui_session::ModelInfo>,
+        Option<String>,
+        Vec<aionui_session::ModeInfo>,
+        Option<String>,
+    ) {
+        let (models, current_model, modes, current_mode) = self.effective_catalog();
+        let capabilities = self.backend.capabilities();
+        self.runtime.set_caps_fallback(CapsFallback {
+            mode: current_mode.clone(),
+            model: current_model.clone(),
+            effort: capabilities.current_effort,
+            service_tier: capabilities.current_service_tier,
+        });
+        if !modes.is_empty() || !models.is_empty() {
+            self.runtime.set_last_catalog(modes.clone(), models.clone());
+        }
+        (models, current_model, modes, current_mode)
+    }
+
     /// Config-options (mode + model selects). For each select the optimistic override
     /// (last set_config_option) wins over the capabilities snapshot's current_value —
     /// this is what makes set_config_option's observed re-read succeed (the snapshot
@@ -1107,30 +1136,10 @@ impl SessionAgentTask {
     pub async fn get_config_options(&self) -> Result<aionui_api_types::GetConfigOptionsResponse, AgentError> {
         // Live catalog wins; cold-start resume falls back to the persisted-handshake
         // preload (per-axis) so the picker renders before the initialize round-trip lands.
-        let (models, current_model, modes, current_mode) = self.effective_catalog();
+        let (models, current_model, modes, current_mode) = self.prime_caps_fallback();
         // The effort catalog depends on the EFFECTIVE current model (override wins over the
         // snapshot's current_model), resolved before the model option consumes it below.
         let effective_model = self.runtime.model_override().or_else(|| current_model.clone());
-        // Mirror what the BACKEND reports into the runtime so the event pump can apply the
-        // same `override → caps` fallback when it re-projects this snapshot. The pump holds
-        // no backend Arc and would otherwise send `None` for every axis the user never
-        // picked — and since the frontend REPLACES its whole snapshot on that frame, those
-        // pickers would go blank (this is the one path that sees both sides).
-        self.runtime.set_caps_fallback(CapsFallback {
-            mode: current_mode.clone(),
-            model: current_model.clone(),
-            effort: self.backend.capabilities().current_effort,
-            service_tier: self.backend.capabilities().current_service_tier,
-        });
-        // Same reason, for the catalog itself: a later confirmation has to re-project the
-        // WHOLE snapshot, and the pump can only do that from a catalog it was handed.
-        // `CatalogUpdated` is not a reliable supply — agy emits none at all (its modes are
-        // static), so gating on it left agy's picker stuck on "switching…" with no signal
-        // that could ever clear it. This path always runs first: the frontend reads
-        // config-options on mount, before any switch is possible.
-        if !modes.is_empty() || !models.is_empty() {
-            self.runtime.set_last_catalog(modes.clone(), models.clone());
-        }
         let mut config_options = Vec::new();
         if !modes.is_empty() {
             config_options.push(aionui_api_types::AcpConfigOptionDto {
@@ -1540,6 +1549,12 @@ impl IAgentTask for SessionAgentTask {
             // (`is_dead_resume_anchor`) cannot cover this path: a dispatch error
             // never becomes a `TurnResult` on the event pump.
             Err(BackendError::SessionNotFound(detail)) => {
+                if detail.starts_with("codex thread/") {
+                    self.runtime.set_status(ConversationStatus::Finished);
+                    return Err(AgentSendError::from_agent_error(AgentError::bad_gateway(format!(
+                        "CODEX_SESSION_RESUME_FAILED: {detail}"
+                    ))));
+                }
                 if let Some(repo) = self.session_repo.as_ref() {
                     match repo
                         .clear_session_id_for_user(&self.user_id, &self.conversation_id)
@@ -1564,7 +1579,15 @@ impl IAgentTask for SessionAgentTask {
                     "Session not found: {detail}"
                 ))))
             }
-            Err(e) => Err(AgentSendError::from_agent_error(AgentError::bad_gateway(e.to_string()))),
+            Err(e) => {
+                let detail = e.to_string();
+                if detail.contains("CODEX_SESSION_RESUME_FAILED:") {
+                    // No turn was accepted. Release the running state so the user
+                    // can switch back to a working account and retry this session.
+                    self.runtime.set_status(ConversationStatus::Finished);
+                }
+                Err(AgentSendError::from_agent_error(AgentError::bad_gateway(detail)))
+            }
         }
     }
 
@@ -2275,6 +2298,7 @@ pub async fn build_session_instance(
         }
     }
 
+    let restoring_history = !matches!(&spec, aionui_session::SessionSpec::Fresh { .. });
     let mut backend = connection
         .open_session(spec, session_config.clone())
         .await
@@ -2321,6 +2345,9 @@ pub async fn build_session_instance(
             {
                 // An empty Codex thread has no rollout to resume. Rebuild only after
                 // the native missing-thread rejection, preserving the saved settings.
+                if restoring_history {
+                    return Err(AgentError::bad_gateway(format!("CODEX_SESSION_RESUME_FAILED: {error}")));
+                }
                 tracing::warn!(conv_id = %conversation_id, "speed restore found a dead Codex thread; rebuilding fresh");
                 if let Some(repo) = acp_session_repo.as_ref()
                     && let Err(error) = repo.clear_session_id_for_user(&user_id, &conversation_id).await
@@ -3169,6 +3196,13 @@ fn spawn_event_pump(
             // the relay breaks the turn on Finish. Per-iteration, so it never leaks
             // across turns.
             let mut pending_empty_turn_tip: Option<TipsEventData> = None;
+            if let SessionEvent::Notice {
+                localized: Some(text), ..
+            } = &env.event
+                && matches!(text.code.as_str(), "CODEX_PLAN_MODE_CHANGED" | "CODEX_GOAL_STATUS")
+            {
+                saw_visible_output = true;
+            }
 
             // ToolOutputDelta needs pump-local accumulation (see above), so it is
             // handled here rather than in the stateless translate_event.
@@ -3737,6 +3771,15 @@ fn is_dead_resume_anchor(event: &SessionEvent) -> bool {
         return false;
     };
     if !is_error || matches!(outcome, TurnOutcome::Cancelled { .. }) {
+        return false;
+    }
+    // Codex history may live in a different account profile. Keep its anchor so
+    // changing accounts or repairing the profile can recover the original thread.
+    let detail = result_text.to_ascii_lowercase();
+    if detail.contains("codex_session_resume_failed:")
+        || detail.starts_with("codex thread/")
+        || detail.starts_with("codex rejected the turn request: thread not found:")
+    {
         return false;
     }
     let reason = aionui_session::ErrorReason::Backend {
@@ -6692,11 +6735,18 @@ mod persist_tests {
 
     /// A backend whose dispatch reports the session as gone (codex resume-poison:
     /// `bound_thread_within` fails fast after a rejected thread/resume).
-    struct DeadSessionBackend;
+    struct DeadSessionBackend {
+        wrapped: bool,
+    }
 
     #[async_trait::async_trait]
     impl SessionBackend for DeadSessionBackend {
         async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            if self.wrapped {
+                return Err(BackendError::Transport(
+                    "CODEX_SESSION_RESUME_FAILED: authentication failed".into(),
+                ));
+            }
             Err(BackendError::SessionNotFound(
                 "codex thread/resume failed: no rollout found for thread id th-dead".into(),
             ))
@@ -6710,18 +6760,23 @@ mod persist_tests {
         }
     }
 
-    // ELECTRON-3Q0 fix B2: a DISPATCH-time dead-session error never becomes a
-    // `TurnResult` on the event pump, so the stream-side self-heal
-    // (`is_dead_resume_anchor`) cannot clear the anchor for it. send_message must
-    // clear it directly and classify the failure as the retryable
-    // UserAgentSessionNotFound so the turn orchestrator auto-replays (Fresh).
+    // A failed cross-account resume must preserve the original backend anchor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn send_dispatch_session_not_found_clears_anchor_and_classifies() {
+    async fn failed_codex_resume_preserves_anchor_and_prevents_fresh_auto_replay() {
+        check_codex_recovery_failure(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_codex_account_switch_releases_running_state_for_manual_retry() {
+        check_codex_recovery_failure(true).await;
+    }
+
+    async fn check_codex_recovery_failure(wrapped: bool) {
         let (repo, _db) = seeded_repo().await;
         repo.update_session_id_for_user("user-1", "conv-1", "dead-anchor")
             .await
             .unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(DeadSessionBackend);
+        let backend: Arc<dyn SessionBackend> = Arc::new(DeadSessionBackend { wrapped });
         let task = SessionAgentTask::new(
             AgentType::Acp,
             "conv-1".into(),
@@ -6742,21 +6797,22 @@ mod persist_tests {
             },
         )
         .await
-        .expect_err("dispatch fails with SessionNotFound");
+        .expect_err("dispatch reports the recovery failure");
 
         assert_eq!(
             err.code(),
-            Some(aionui_api_types::AgentErrorCode::UserAgentSessionNotFound),
-            "classified as the retryable session-not-found so TurnRecoveryPolicy replays once"
+            Some(aionui_api_types::AgentErrorCode::UserAgentSessionResumeFailed),
+            "recovery failure is visible without authorizing a fresh auto-replay"
         );
         let row = repo
             .get_for_user("user-1", "conv-1")
             .await
             .unwrap()
             .expect("row exists");
-        assert!(
-            row.session_id.is_none(),
-            "a dispatch-time dead session must clear the resume anchor — the replay/next send opens Fresh"
+        assert_eq!(row.session_id.as_deref(), Some("dead-anchor"));
+        assert_eq!(
+            crate::agent_task::IAgentTask::status(task.as_ref()),
+            Some(ConversationStatus::Finished)
         );
     }
 
@@ -7743,6 +7799,8 @@ mod pump_tests {
     struct GatedScriptBackend {
         script: Vec<SessionEnvelope>,
         gate: Arc<tokio::sync::Notify>,
+        /// Backend-side current values used to verify construction-time seeding.
+        caps: Capabilities,
     }
 
     #[async_trait::async_trait]
@@ -7769,7 +7827,7 @@ mod pump_tests {
                 .boxed()
         }
         fn capabilities(&self) -> Capabilities {
-            Capabilities::default()
+            self.caps.clone()
         }
     }
 
@@ -7813,10 +7871,15 @@ mod pump_tests {
     // before releasing is what makes the collection deterministic — see
     // `GatedScriptBackend`.
     async fn drain_script(script: Vec<SessionEnvelope>) -> Vec<AgentStreamEvent> {
+        drain_script_with_caps(script, Capabilities::default()).await
+    }
+
+    async fn drain_script_with_caps(script: Vec<SessionEnvelope>, caps: Capabilities) -> Vec<AgentStreamEvent> {
         let gate = Arc::new(tokio::sync::Notify::new());
         let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
             script,
             gate: gate.clone(),
+            caps,
         });
         let task = SessionAgentTask::new(
             AgentType::Acp,
@@ -8074,6 +8137,65 @@ mod pump_tests {
             model_values,
             vec!["default", "opus"],
             "the parsed model ids ride the frame"
+        );
+    }
+
+    // A task rebuilt after idle reclaim goes through `send_message`, not REST
+    // `get_config_options`. Its first pushed catalog must therefore carry the
+    // spawn-time current values seeded during construction rather than `None`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_updated_carries_spawn_seeded_current_model() {
+        use aionui_session::{ModeInfo, ModelInfo};
+        let model = |id: &str| ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            description: None,
+            reasoning_efforts: Vec::new(),
+            ..Default::default()
+        };
+        let caps = Capabilities {
+            current_model: Some("fable".into()),
+            current_mode: Some("bypassPermissions".into()),
+            ..Capabilities::default()
+        };
+        let script = vec![env(SessionEvent::CatalogUpdated {
+            models: vec![model("fable"), model("opus")],
+            modes: vec![ModeInfo {
+                id: "bypassPermissions".into(),
+                name: "Bypass Permissions".into(),
+                description: None,
+            }],
+            slash_commands: Vec::new(),
+        })];
+        let frames = drain_script_with_caps(script, caps).await;
+        let config = frames
+            .iter()
+            .find_map(|f| match f {
+                AgentStreamEvent::AcpConfigOption(v) => Some(v),
+                _ => None,
+            })
+            .expect("CatalogUpdated must project to an AcpConfigOption frame");
+        let options = config
+            .get("config_options")
+            .and_then(|v| v.as_array())
+            .expect("config_options array");
+        let current = |category: &str| {
+            options
+                .iter()
+                .find(|o| o.get("category").and_then(|c| c.as_str()) == Some(category))
+                .unwrap_or_else(|| panic!("{category} category"))
+                .get("current_value")
+                .cloned()
+        };
+        assert_eq!(
+            current("model"),
+            Some(serde_json::json!("fable")),
+            "the spawn model from capabilities() must ride the catalog frame"
+        );
+        assert_eq!(
+            current("mode"),
+            Some(serde_json::json!("bypassPermissions")),
+            "the spawn mode from capabilities() must ride the catalog frame"
         );
     }
 
@@ -9242,6 +9364,7 @@ mod pump_tests {
         let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
             script,
             gate: gate.clone(),
+            caps: Capabilities::default(),
         });
         let task = SessionAgentTask::new(
             AgentType::Acp,

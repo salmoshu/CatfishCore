@@ -511,6 +511,18 @@ impl ConversationTurnOrchestrator {
             auth_failure = terminal_is_auth_failure(&attempt_result.outcome);
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
+            if attempt_result.summary.empty_reply {
+                final_error_message = Some("The Agent returned no visible reply".to_owned());
+                if attempt_result.agent_type == AgentType::Acp
+                    && lifecycle == RuntimeLifecycleState::Active
+                    && attempt_result.summary.safe_to_auto_replay()
+                {
+                    self.service
+                        .recover_empty_reply_runtime(&input.user_id, &conv_id, &turn_id, &self.task_manager)
+                        .await;
+                }
+                break true;
+            }
             if !attempt_result.outcome.terminal.is_error() {
                 final_error_message = None;
                 if replayed {
@@ -684,9 +696,6 @@ fn availability_agent_id(options: &BuildTaskOptions) -> Option<String> {
 /// rate-limit, context, network — are deliberately excluded so we don't flip an
 /// agent to unavailable for transient or unrelated failures.
 fn terminal_is_auth_failure(outcome: &RelayOutcome) -> bool {
-    if outcome.attempt.needs_auth {
-        return true;
-    }
     matches!(
         outcome.terminal.code(),
         Some(
@@ -953,7 +962,7 @@ mod tests {
 
     #[test]
     fn needs_auth_empty_turn_is_auth_failure() {
-        assert!(terminal_is_auth_failure(&finish_outcome(true)));
+        assert!(!terminal_is_auth_failure(&finish_outcome(true)));
     }
 
     #[test]

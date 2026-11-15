@@ -430,10 +430,10 @@ async fn open_system_file(
 // Content endpoint (ChatFileRef identity) — handlers
 // ---------------------------------------------------------------------------
 
-/// Managed upload directory (`<tmp>/aionui`) used to validate `Upload`
+/// Managed upload directory (`<tmp>/catfish`) used to validate `Upload`
 /// ChatFileRef variants — mirrors the chat send-boundary convention.
 fn content_upload_root() -> PathBuf {
-    std::env::temp_dir().join("aionui")
+    std::env::temp_dir().join("catfish")
 }
 
 /// Parse the optional `If-Match` header as a last-modified-millisecond stamp.

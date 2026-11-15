@@ -296,6 +296,10 @@ impl TitleGen {
         self.pending.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn disarm(&self) {
+        self.pending.store(false, Ordering::SeqCst);
+    }
+
     /// Record the first prompt's text (first non-empty wins), bounded like the
     /// claude path so a huge prompt cannot blow up the description.
     pub(crate) fn record_first_prompt(&self, text: &str) {

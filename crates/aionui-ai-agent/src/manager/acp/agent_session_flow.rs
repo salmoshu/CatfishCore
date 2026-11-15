@@ -80,24 +80,11 @@ impl AcpAgentManager {
         Ok(sid)
     }
 
-    /// Drop the in-aggregate session id and re-run `open_session_new`.
-    /// Used as the rescue path when resume helpers see `SessionNotFound`.
-    /// Emits a `warn!` so ops can still see the original failure that
-    /// triggered the rebuild.
+    /// Report a rejected resume while preserving the original native session anchor.
     async fn rebuild_after_session_not_found(&self, stale_sid: &str, err: &AcpError) -> Result<String, AgentError> {
-        warn!(
-            conversation_id = %self.params.conversation_id,
-            stale_session_id = %stale_sid,
-            recovery_action = "clear_persisted_session_id_and_session_new",
-            error = %err,
-            "open_session_resume: stale session id rejected by CLI; clearing persisted session id and rebuilding via session/new"
-        );
-        {
-            let mut session = self.session.write().await;
-            session.clear_session_id();
-            self.commit_session_changes(&mut session).await;
-        }
-        self.open_session_new().await
+        warn!(conversation_id = %self.params.conversation_id, stale_session_id = %stale_sid,
+            "ACP resume rejected; preserving the original session anchor");
+        Err(AgentError::bad_gateway(format!("AGENT_SESSION_RESUME_FAILED: {err}")))
     }
 
     async fn rebuild_after_acp_session_not_found(&self, stale_sid: &str, err: AcpError) -> Result<String, AgentError> {
@@ -115,12 +102,7 @@ impl AcpAgentManager {
     /// - Backends that support neither: seed the aggregate and hope the CLI
     ///   still recognises the id (legacy behaviour — matches pre-refactor).
     ///
-    /// In all three branches a `SessionNotFound` reply (the persisted sid
-    /// became stale, e.g. after a CLI upgrade or restart) triggers
-    /// `rebuild_after_session_not_found`, which clears the sid and
-    /// re-runs `open_session_new`. ELECTRON-1HQ regressed because we
-    /// silently swallowed this case during warmup, leaving every
-    /// subsequent `session/prompt` to surface the same error to the user.
+    /// A rejected resume is surfaced explicitly; never replace history with a fresh session.
     pub(super) async fn open_session_resume(&self, session_id: &str) -> Result<String, AgentError> {
         if agent_metadata_uses_meta_resume(&self.params.metadata) {
             let mut meta = serde_json::Map::new();
@@ -384,7 +366,16 @@ impl AcpAgentManager {
         // the signal is correlated strictly to the turn/near-window — signals
         // seen earlier in the session lifetime are never attributed here.
         let observations = drain_turn_observations(&mut probe_rx);
-        let empty_turn = observations.empty;
+        let live_background_tasks = crate::agent_task::IAgentTask::live_background_tasks(self);
+        if observations.empty && live_background_tasks > 0 {
+            tracing::info!(
+                conversation_id = %self.params.conversation_id,
+                session_id = %sid,
+                live_background_tasks,
+                "ACP prompt returned without visible output while work is still running; suppressing empty-turn diagnostics"
+            );
+        }
+        let empty_turn = should_diagnose_empty_turn(observations.empty, live_background_tasks);
         if empty_turn && let Some(error) = self.empty_turn_terminal_error().await {
             return Ok(PromptOutcome::TerminalError {
                 session_id: sid.to_owned(),
@@ -392,12 +383,7 @@ impl AcpAgentManager {
             });
         }
 
-        // On an empty end-of-turn, surface the agent's advertised login method
-        // (if any). ACP defines no auth-failure stop reason, so an agent that
-        // isn't signed in can swallow the failure and return `end_turn` with no
-        // content (observed with kilo: the model call 401s, yet ACP reports a
-        // clean empty turn). The stable `authMethods` from `initialize` lets us
-        // turn that blank tip into an actionable "you may need to sign in" hint.
+        // Advertised login methods are optional guidance, never evidence of an authentication failure.
         let auth_hint = if empty_turn {
             auth_login_hint(self.session.read().await.auth_methods())
         } else {
@@ -595,6 +581,10 @@ fn drain_turn_observations(rx: &mut tokio::sync::broadcast::Receiver<AgentStream
     TurnObservations { empty, dialect_signal }
 }
 
+fn should_diagnose_empty_turn(observed_empty: bool, live_background_tasks: usize) -> bool {
+    observed_empty && live_background_tasks == 0
+}
+
 /// Whether a stream event represents user-visible output produced by the
 /// model during a turn. Anything that would render in chat counts.
 fn event_is_user_visible_output(event: &AgentStreamEvent) -> bool {
@@ -690,7 +680,7 @@ fn prompt_outcome_from_stop_reason(
     session_id: &str,
     stop_reason: StopReason,
     empty_turn: bool,
-    _matched_command: Option<&SlashCommandItem>,
+    matched_command: Option<&SlashCommandItem>,
     auth_hint: Option<Value>,
     token_limit_signal: bool,
 ) -> PromptOutcome {
@@ -714,21 +704,11 @@ fn prompt_outcome_from_stop_reason(
                     tips: empty_turn_info_tip("ACP_EMPTY_TURN_TOKEN_LIMIT", None),
                 };
             }
-            // The agent ended the turn producing nothing. If it advertised a
-            // login method at initialize, the most likely cause is that it
-            // isn't signed in and silently returned an empty end_turn — point
-            // the user at the login step instead of a blank tip. (Presence of
-            // authMethods is not proof of being logged out, so the client copy
-            // must stay a soft "may need sign-in" hint, not an assertion.)
-            if let Some(params) = auth_hint {
-                return PromptOutcome::InfoTip {
-                    session_id: session_id.to_owned(),
-                    tips: empty_turn_info_tip("ACP_EMPTY_TURN_NEEDS_AUTH", Some(params)),
-                };
-            }
+            let mut params = auth_hint.unwrap_or_else(|| serde_json::json!({}));
+            params["recovery_eligible"] = Value::Bool(matched_command.is_none());
             return PromptOutcome::InfoTip {
                 session_id: session_id.to_owned(),
-                tips: empty_turn_info_tip("ACP_EMPTY_TURN", None),
+                tips: empty_turn_info_tip("ACP_EMPTY_TURN", Some(params)),
             };
         }
 
@@ -819,6 +799,7 @@ mod tests {
     };
 
     use super::{end_turn_usage_frame, end_turn_usage_frame_from_response, preserve_known_window};
+    use serde_json::Value;
 
     /// The end-of-turn usage frame must stay deserializable as `UsageUpdate` —
     /// that is the contract with `agent_event_tracker`, which persists the
@@ -1335,13 +1316,32 @@ mod tests {
             super::PromptOutcome::InfoTip { session_id, tips } => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(tips.tip_type, TipType::Info);
-                assert_eq!(tips.code.as_deref(), Some("ACP_EMPTY_TURN_NEEDS_AUTH"));
+                assert_eq!(tips.code.as_deref(), Some("ACP_EMPTY_TURN"));
                 let params = tips.params.expect("needs-auth tip carries params");
                 assert_eq!(params["hint"], "Run `kilo auth login` in the terminal");
                 assert!(params["methods"].is_array());
             }
             other => panic!("expected InfoTip, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_turn_with_live_work_does_not_emit_auth_hint() {
+        assert!(!super::should_diagnose_empty_turn(true, 1));
+        let outcome = super::prompt_outcome_from_stop_reason(
+            "sess-1",
+            StopReason::EndTurn,
+            super::should_diagnose_empty_turn(true, 1),
+            None,
+            None,
+            false,
+        );
+
+        assert!(matches!(
+            outcome,
+            super::PromptOutcome::Completed { session_id } if session_id == "sess-1"
+        ));
+        assert!(super::should_diagnose_empty_turn(true, 0));
     }
 
     #[test]
@@ -1389,7 +1389,7 @@ mod tests {
             super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, true, None, Some(auth_hint), false);
         match outcome {
             super::PromptOutcome::InfoTip { tips, .. } => {
-                assert_eq!(tips.code.as_deref(), Some("ACP_EMPTY_TURN_NEEDS_AUTH"));
+                assert_eq!(tips.code.as_deref(), Some("ACP_EMPTY_TURN"));
             }
             other => panic!("expected InfoTip, got {other:?}"),
         }
@@ -1476,7 +1476,13 @@ mod tests {
                 assert_eq!(tips.tip_type, TipType::Info);
                 assert_eq!(tips.code.as_deref(), Some("ACP_EMPTY_TURN"));
                 assert_eq!(tips.content, "");
-                assert_eq!(tips.params, None);
+                assert_eq!(
+                    tips.params
+                        .as_ref()
+                        .and_then(|p| p.get("recovery_eligible"))
+                        .and_then(Value::as_bool),
+                    Some(false)
+                );
             }
             other => panic!("expected InfoTip, got {other:?}"),
         }

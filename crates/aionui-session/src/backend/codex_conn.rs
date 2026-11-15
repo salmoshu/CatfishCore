@@ -11,10 +11,10 @@
 //!    An unknown future `type` is data, not a panic.
 //!  - A2/A3 (reverse-RPC deadlock): the reader loop WRITES A REAL JSON-RPC
 //!    RESPONSE back to stdin for blocking server requests so the channel never
-//!    deadlocks / hangs the turn. Infra requests (`account/chatgptAuthTokens/
-//!    refresh`, `attestation/generate`) get an immediate -32601 error (we hold no
-//!    ChatGPT tokens — this deployment runs codex on Bedrock — so the honest reply
-//!    is "unsupported", which unblocks); tool/file approvals are NOT auto-answered
+//!    deadlocks / hangs the turn. Cross-account token refresh uses the selected
+//!    profile's credential provider; other auth challenges remain explicit.
+//!    Unsupported attestation requests get an immediate -32601 error.
+//!    Tool/file approvals are NOT auto-answered
 //!    — they surface as `Permission` and the conversation's `AnswerPermission`
 //!    writes the keyed accept/decline response.
 //!
@@ -30,6 +30,7 @@ use aionui_process::Spawner;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 
+use super::codex_resume::{CodexAuthProvider, CodexProfiles};
 #[cfg(any(test, feature = "test-support"))]
 use super::codex_title::NoTitleIo;
 use super::codex_title::{SpawnedTitleIo, TitleGen};
@@ -47,6 +48,28 @@ use futures_util::stream::{BoxStream, StreamExt};
 const CODEX_CONFIG_FLAG: &str = "-c";
 const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all";
 const CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY: &str = "shell_environment_policy.include_only=[]";
+
+fn resume_failed(error: impl std::fmt::Display) -> BackendError {
+    BackendError::Transport(format!("CODEX_SESSION_RESUME_FAILED: {error}"))
+}
+
+fn same_home(left: Option<&std::path::Path>, right: Option<&std::path::Path>) -> bool {
+    left == right
+        || match (
+            left.and_then(|path| path.canonicalize().ok()),
+            right.and_then(|path| path.canonicalize().ok()),
+        ) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        }
+}
+
+#[derive(Clone, Default)]
+struct CodexAuthentication {
+    provider: Arc<Mutex<Option<CodexAuthProvider>>>,
+    pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<bool>>>>,
+    generation: Arc<AtomicU64>,
+}
 
 /// Config overrides that make Codex command-execution children inherit the
 /// runtime environment injected into the app-server process.
@@ -118,7 +141,36 @@ impl BackendConnection for CodexConnection {
             SessionSpec::Resume { session_id, .. } => session_id.clone(),
             SessionSpec::Fork { session_id, .. } => session_id.clone(),
         };
-        let args = codex_app_server_args(&config.extra_args);
+        let profiles = CodexProfiles::from_env(&config.spawn_env);
+        let profile_home = profiles.active_home().map_err(|error| {
+            if matches!(spec, SessionSpec::Resume { .. }) {
+                resume_failed(error)
+            } else {
+                BackendError::Transport(error)
+            }
+        })?;
+        let resume_id = match &spec {
+            SessionSpec::Resume { backend_session_id, .. } => backend_session_id.clone(),
+            _ => None,
+        };
+        let history_home = if let Some(thread_id) = resume_id {
+            let resolver = profiles.clone();
+            tokio::task::spawn_blocking(move || {
+                resolver
+                    .rollout(&thread_id)
+                    .and_then(|path| resolver.history_home(&path))
+            })
+            .await
+            .map_err(|_| resume_failed("could not locate the previous history store"))?
+        } else {
+            None
+        };
+        let history_home = history_home.or_else(|| profile_home.clone());
+        let external_login = !same_home(profile_home.as_deref(), history_home.as_deref());
+        let mut args = codex_app_server_args(&config.extra_args);
+        if external_login {
+            args.extend(["-c".into(), "cli_auth_credentials_store=\"ephemeral\"".into()]);
+        }
         log_codex_runtime_policy(&config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Orchestration-resolved bundled CLI (packaged app) or bare "codex"
@@ -128,8 +180,17 @@ impl BackendConnection for CodexConnection {
             // #103 (parity with claude_conn): forward the orchestration-filled
             // spawn env (per-agent overrides + AIONUI_* conversation runtime
             // context). Empty = inherit the parent env only, as before.
-            env: config.spawn_env.clone(),
+            env: profiles.spawn_env(&config.spawn_env, history_home.as_deref()),
             cwd: config.cwd.clone(),
+        };
+        let authentication = if external_login {
+            let mut auth_command = cmd.clone();
+            auth_command.env = profiles.spawn_env(&config.spawn_env, profile_home.as_deref());
+            profile_home
+                .clone()
+                .map(|home| CodexAuthProvider::new(home, self.spawner.clone(), auth_command))
+        } else {
+            None
         };
         let title_cmd = cmd.clone();
         let proc = self
@@ -157,6 +218,10 @@ impl BackendConnection for CodexConnection {
         title_gen.set_model(config.model.clone());
         let mut backend =
             CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms, title_gen).await;
+        backend.profiles = Some(profiles);
+        *backend.profile_home.lock().await = profile_home.clone();
+        *backend.history_home.lock().await = history_home;
+        *backend.authentication.provider.lock().await = authentication;
         // Report a codex whose version differs from the release AionUi verified.
         // codex runs from the user's own install (nothing is bundled), the same
         // situation agy has always been in. Placed here rather than at the two
@@ -243,7 +308,30 @@ impl BackendConnection for CodexConnection {
                 last_turn_id: at_turn_id.as_deref(),
             },
         };
-        backend.run_handshake(handshake_mode).await?;
+        let resuming = matches!(
+            spec,
+            SessionSpec::Resume {
+                backend_session_id: Some(_),
+                ..
+            }
+        );
+        backend.run_handshake(handshake_mode).await.map_err(
+            |error| {
+                if resuming { resume_failed(error) } else { error }
+            },
+        )?;
+        if resuming {
+            backend.confirm_resume().await?;
+            if let Ok(result) = backend
+                .control_rpc("thread/goal/get", json!({"threadId": backend.bound_thread().await?}))
+                .await
+            {
+                backend.goal_active.store(
+                    result.pointer("/goal/status").and_then(Value::as_str) == Some("active"),
+                    Ordering::SeqCst,
+                );
+            }
+        }
 
         // codex-model-gating: `thread/start` intentionally did NOT bind `config.model`
         // (see `thread_start_params`), nor a permission tier (`thread/start` carries no
@@ -598,6 +686,11 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
 fn thread_resume_params(config: &SessionConfig, thread_id: &str) -> HandshakeParams {
     let HandshakeParams(mut params) = thread_start_params(config);
     params["threadId"] = json!(thread_id);
+    // Resume only restores Codex's native execution state. The response's
+    // turn payload is not consumed here; avoid deprecated full-history
+    // hydration for paginated threads.
+    // Verified: Codex 0.169.0 v2/ThreadResumeParams.json, `excludeTurns`.
+    params["excludeTurns"] = json!(true);
     HandshakeParams(params)
 }
 
@@ -760,6 +853,18 @@ fn builtin_slash_commands() -> Vec<crate::capability::SlashCommandInfo> {
     use crate::capability::SlashCommandInfo;
     vec![
         SlashCommandInfo {
+            name: "plan".into(),
+            description: Some("Switch to planning mode; optionally include a task".into()),
+        },
+        SlashCommandInfo {
+            name: "default".into(),
+            description: Some("Switch to execution mode".into()),
+        },
+        SlashCommandInfo {
+            name: "goal".into(),
+            description: Some("Set a persistent goal, or use status, pause, resume, clear".into()),
+        },
+        SlashCommandInfo {
             name: "review".into(),
             description: Some("Review my current changes and find issues".into()),
         },
@@ -817,6 +922,14 @@ pub struct CodexSessionBackend {
     idle_timer: Option<tokio::task::JoinHandle<()>>,
     /// Everything needed to re-spawn (`thread/resume`) the codex app-server on wake.
     wake: CodexWakeRecipe,
+    /// Account selection is re-read before a new turn; credentials remain in their profile.
+    profiles: Option<CodexProfiles>,
+    profile_home: Mutex<Option<std::path::PathBuf>>,
+    history_home: Mutex<Option<std::path::PathBuf>>,
+    profile_gate: Mutex<()>,
+    /// Preserve the requested thread even if the reader rejects its live binding.
+    resume_anchor: Mutex<Option<String>>,
+    authentication: CodexAuthentication,
     /// Shared reader-task inputs, cloned into the open-time reader AND every
     /// post-wake reader so they drain into the same event_tx/turn_gen/bindings.
     reader_state: CodexReaderState,
@@ -907,6 +1020,8 @@ pub struct CodexSessionBackend {
     /// `map_notification` → ConfigChanged, live-verified), so emitting here too would
     /// duplicate the ConfigChanged. The codex analogue of acp_conn's `pending_set`.
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    pending_controls: PendingControls,
+    goal_active: Arc<std::sync::atomic::AtomicBool>,
     /// B5 mid-turn delivery: rpc-id → in-flight `turn/steer` ack correlation.
     /// dispatch(Steer) inserts and AWAITS the oneshot so the caller learns the
     /// synchronous accept/reject (codex acks a steer with `{turnId}` ~0ms,
@@ -944,6 +1059,8 @@ struct PendingSteer {
 /// be terminated with an is_error terminal (the FSM already went Running via
 /// the lowered TurnStarted); a NoTurn request (/logout → account/logout) never
 /// opened a turn, so the rejection surfaces as a Notice instead.
+type PendingControls = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>>;
+
 #[derive(Clone)]
 struct PendingSend {
     client_msg_id: Option<String>,
@@ -1003,6 +1120,7 @@ impl CodexWakeRecipe {
 /// and bindings (the threadId binding survives a suspend, so a wake re-attaches).
 #[derive(Clone)]
 struct CodexReaderState {
+    authentication: CodexAuthentication,
     session_id: String,
     turn_gen: Arc<AtomicU64>,
     event_tx: broadcast::Sender<SessionEnvelope>,
@@ -1013,6 +1131,8 @@ struct CodexReaderState {
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    pending_controls: PendingControls,
+    goal_active: Arc<std::sync::atomic::AtomicBool>,
     pending_steers: Arc<Mutex<HashMap<u64, PendingSteer>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
@@ -1051,6 +1171,8 @@ fn start_codex_reader(
             state.pending_sends,
             state.pending_discovery,
             state.pending_set,
+            state.pending_controls,
+            state.goal_active,
             state.pending_steers,
             state.pending_resume,
             state.resume_poison,
@@ -1059,6 +1181,7 @@ fn start_codex_reader(
             state.stdin,
             state.turn_in_flight,
             state.title_gen,
+            state.authentication,
         )
         .await;
     })
@@ -1262,6 +1385,8 @@ impl CodexSessionBackend {
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
+        let pending_controls = Arc::new(Mutex::new(HashMap::new()));
+        let goal_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending_steers = Arc::new(Mutex::new(HashMap::new()));
         let pending_resume = Arc::new(Mutex::new(None));
         let resume_poison = Arc::new(Mutex::new(None));
@@ -1269,6 +1394,7 @@ impl CodexSessionBackend {
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (event_tx, _) = broadcast::channel(1024);
+        let authentication = CodexAuthentication::default();
 
         let (stdin, stdout) = match io.take_stdio().await {
             Some((stdin, stdout)) => (Some(stdin), Some(stdout)),
@@ -1277,6 +1403,7 @@ impl CodexSessionBackend {
         let stdin = Arc::new(Mutex::new(stdin));
 
         let reader_state = CodexReaderState {
+            authentication: authentication.clone(),
             session_id: session_id.clone(),
             turn_gen: turn_gen.clone(),
             event_tx: event_tx.clone(),
@@ -1287,6 +1414,8 @@ impl CodexSessionBackend {
             pending_sends: pending_sends.clone(),
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
+            pending_controls: pending_controls.clone(),
+            goal_active: goal_active.clone(),
             pending_steers: pending_steers.clone(),
             pending_resume: pending_resume.clone(),
             resume_poison: resume_poison.clone(),
@@ -1336,6 +1465,12 @@ impl CodexSessionBackend {
             suspend,
             idle_timer,
             wake,
+            profiles: None,
+            profile_home: Mutex::new(None),
+            history_home: Mutex::new(None),
+            profile_gate: Mutex::new(()),
+            resume_anchor: Mutex::new(None),
+            authentication,
             reader_state,
             turn_in_flight,
             thread_binding,
@@ -1346,6 +1481,8 @@ impl CodexSessionBackend {
             pending_sends,
             pending_discovery,
             pending_set,
+            pending_controls,
+            goal_active,
             pending_steers,
             pending_resume,
             resume_poison,
@@ -1409,7 +1546,9 @@ impl CodexSessionBackend {
             if let Some(poison) = self.resume_poison.lock().await.clone() {
                 return Err(BackendError::SessionNotFound(poison));
             }
-            if let Some(tid) = self.thread_binding.lock().await.clone() {
+            if self.pending_resume.lock().await.is_none()
+                && let Some(tid) = self.thread_binding.lock().await.clone()
+            {
                 return Ok(tid);
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1432,6 +1571,7 @@ impl CodexSessionBackend {
         *self.resume_poison.lock().await = None;
         self.write_frame(initialize_params().into_frame(self.next_rpc_id(), "initialize"))
             .await?;
+        self.authenticate_selected_account().await?;
 
         // Layer 1 (protocol): register this conversation's skill view. Sent after
         // `initialize` (the probe order) and before thread start/resume so the
@@ -1453,7 +1593,20 @@ impl CodexSessionBackend {
 
         match mode {
             HandshakeMode::Resume(tid) => {
+                *self.resume_anchor.lock().await = Some(tid.to_owned());
                 *self.thread_binding.lock().await = Some(tid.to_string());
+                let mut params = thread_resume_params(&self.wake.config, tid);
+                if let Some(profiles) = self.profiles.clone() {
+                    let thread_id = tid.to_owned();
+                    let rollout = tokio::task::spawn_blocking(move || profiles.rollout(&thread_id))
+                        .await
+                        .map_err(|_| resume_failed("could not locate the previous session history"))?;
+                    if let Some(path) = rollout {
+                        // Verified: Codex 0.167.0 v2/ThreadResumeParams.json, `path`.
+                        // Let Codex load its native history; never replay tool calls as text.
+                        params.0["path"] = json!(path);
+                    }
+                }
                 // Resume re-sends the full thread/start override surface — a bare
                 // {threadId} resume silently drops the user's MCP servers and
                 // resets approvalPolicy to its default (LIVE 0.144.1, see
@@ -1466,8 +1619,7 @@ impl CodexSessionBackend {
                 // (ELECTRON-3Q0).
                 let resume_id = self.next_rpc_id();
                 *self.pending_resume.lock().await = Some(resume_id);
-                self.write_frame(thread_resume_params(&self.wake.config, tid).into_frame(resume_id, "thread/resume"))
-                    .await?;
+                self.write_frame(params.into_frame(resume_id, "thread/resume")).await?;
             }
             HandshakeMode::Fork {
                 parent_thread_id,
@@ -1537,15 +1689,42 @@ impl CodexSessionBackend {
             .spawner
             .as_ref()
             .ok_or_else(|| BackendError::Transport("codex wake: no spawner (suspension not enabled)".into()))?;
-        let args = codex_app_server_args(&self.wake.config.extra_args);
+        let history_home = self.history_home.lock().await.clone();
+        let profile_home = match &self.profiles {
+            Some(profiles) => profiles.active_home().map_err(resume_failed)?,
+            None => None,
+        };
+        let spawn_env = match &self.profiles {
+            Some(profiles) => profiles.spawn_env(
+                &self.wake.config.spawn_env,
+                history_home.as_deref().or(profile_home.as_deref()),
+            ),
+            None => self.wake.config.spawn_env.clone(),
+        };
+        let external_login = self.profiles.is_some() && !same_home(profile_home.as_deref(), history_home.as_deref());
+        let mut args = codex_app_server_args(&self.wake.config.extra_args);
+        if external_login {
+            args.extend(["-c".into(), "cli_auth_credentials_store=\"ephemeral\"".into()]);
+        }
         log_codex_runtime_policy(&self.wake.config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Same bundled-CLI resolution + spawn env as the initial spawn
             // (R16 continuity).
             command: self.wake.config.cli_program.clone().unwrap_or_else(|| "codex".into()),
             args,
-            env: self.wake.config.spawn_env.clone(),
+            env: spawn_env,
             cwd: self.wake.config.cwd.clone(),
+        };
+        *self.authentication.provider.lock().await = if external_login {
+            let mut auth_command = cmd.clone();
+            if let Some(profiles) = &self.profiles {
+                auth_command.env = profiles.spawn_env(&self.wake.config.spawn_env, profile_home.as_deref());
+            }
+            profile_home
+                .clone()
+                .map(|home| CodexAuthProvider::new(home, spawner.clone(), auth_command))
+        } else {
+            None
         };
         let proc = spawner
             .spawn(cmd, &[], "aionui-session")
@@ -1556,7 +1735,11 @@ impl CodexSessionBackend {
             Some((stdin, stdout)) => (Some(stdin), Some(stdout)),
             None => (None, None),
         };
-        *self.stdin.lock().await = stdin;
+        {
+            let mut slot = self.stdin.lock().await;
+            self.authentication.generation.fetch_add(1, Ordering::SeqCst);
+            *slot = stdin;
+        }
         // The pre-suspend turn id is dead — a fresh process has no active turn yet.
         // Clearing it prevents a steer/interrupt right after wake from targeting a
         // stale turn id (the reader re-binds active_turn_id on the next turn/started).
@@ -1569,16 +1752,156 @@ impl CodexSessionBackend {
         // A wake NEVER replays a fork: by the time a session can idle-suspend,
         // its fork completed and `thread_binding` holds the NEW thread — resume
         // against it (or Fresh if the binding was lost, the pre-fork behavior).
-        let resume_tid = self.thread_binding.lock().await.clone();
+        let resume_tid = self
+            .thread_binding
+            .lock()
+            .await
+            .clone()
+            .or(self.resume_anchor.lock().await.clone());
         let mode = match resume_tid.as_deref() {
             Some(tid) => HandshakeMode::Resume(tid),
             None => HandshakeMode::Fresh,
         };
         if let Err(e) = self.run_handshake(mode).await {
             reader.abort();
-            return Err(e);
+            return Err(if resume_tid.is_some() { resume_failed(e) } else { e });
         }
+        if resume_tid.is_some()
+            && self.profiles.is_some()
+            && let Err(error) = self.confirm_resume().await
+        {
+            reader.abort();
+            io.terminate().await;
+            return Err(error);
+        }
+        *self.profile_home.lock().await = profile_home;
         Ok(ProcHandle::new(reader, io))
+    }
+
+    async fn confirm_resume(&self) -> Result<(), BackendError> {
+        self.bound_thread().await.map(|_| ()).map_err(|error| {
+            tracing::warn!(conversation_id = %self.session_id, "Codex session recovery failed; original history and resume anchor preserved");
+            resume_failed(error)
+        })
+    }
+
+    /// Native schemas verified with Codex 0.167.0 v2/ThreadGoalSetParams.json and ThreadSettingsUpdateParams.json.
+    async fn control_rpc(&self, method: &str, params: Value) -> Result<Value, BackendError> {
+        let id = self.next_rpc_id();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.pending_controls.lock().await.insert(id, sender);
+        if let Err(error) = self.write_frame(json!({"id":id,"method":method,"params":params})).await {
+            self.pending_controls.lock().await.remove(&id);
+            return Err(error);
+        }
+        let reply = tokio::time::timeout(super::handshake_budget(), receiver).await;
+        self.pending_controls.lock().await.remove(&id);
+        match reply {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(error))) => Err(BackendError::Transport(error)),
+            _ => Err(BackendError::Transport(
+                "Codex did not acknowledge the control command".into(),
+            )),
+        }
+    }
+
+    fn complete_control(&self, code: &str, message: &str, params: Value) -> CommandReceipt {
+        let generation = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        for event in [
+            SessionEvent::TurnStarted { epoch: generation },
+            SessionEvent::Notice {
+                level: crate::event::NoticeLevel::Info,
+                message: message.into(),
+                localized: Some(crate::event::LocalizedText {
+                    code: code.into(),
+                    params: params.as_object().cloned().unwrap_or_default(),
+                }),
+                supersedes_key: None,
+            },
+            SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: generation,
+                outcome: TurnOutcome::Completed {
+                    stop_reason: StopReason::EndTurn,
+                },
+            },
+        ] {
+            emit(&self.event_tx, &self.session_id, generation, event);
+        }
+        CommandReceipt {
+            accepted: true,
+            admission: Admission::NoTurn,
+            turn_gen: generation,
+        }
+    }
+
+    async fn pause_goal(&self, tid: &str) -> Result<(), BackendError> {
+        if !self.goal_active.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let result = self.control_rpc("thread/goal/get", json!({"threadId":tid})).await?;
+        if result.get("goal").is_some_and(|goal| !goal.is_null()) {
+            self.control_rpc(
+                "thread/goal/set",
+                json!({"threadId":tid,"status":"paused","origin":"user"}),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn authenticate_selected_account(&self) -> Result<(), BackendError> {
+        let Some(provider) = self.authentication.provider.lock().await.clone() else {
+            return Ok(());
+        };
+        let params = provider.login_params(false).await.map_err(resume_failed)?;
+        let id = self.next_rpc_id();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.authentication.pending.lock().await.insert(id, sender);
+        if let Err(error) = self
+            .write_frame(json!({"id":id,"method":"account/login/start","params":params}))
+            .await
+        {
+            self.authentication.pending.lock().await.remove(&id);
+            return Err(resume_failed(error));
+        }
+        let result = tokio::time::timeout(super::handshake_budget(), receiver).await;
+        self.authentication.pending.lock().await.remove(&id);
+        match result {
+            Ok(Ok(true)) => Ok(()),
+            _ => Err(resume_failed(
+                "could not authenticate the selected account while preserving the original history",
+            )),
+        }
+    }
+
+    async fn refresh_account(&self) -> Result<(), BackendError> {
+        let Some(profiles) = &self.profiles else { return Ok(()) };
+        let _guard = self.profile_gate.lock().await;
+        let selected = profiles.active_home().map_err(resume_failed)?;
+        if selected == *self.profile_home.lock().await || self.turn_in_flight.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        // Recycle only between turns. The original thread is retained across the restart.
+        if let Some(thread_id) = self.thread_binding.lock().await.clone() {
+            *self.resume_anchor.lock().await = Some(thread_id);
+        }
+        tracing::info!(conversation_id = %self.session_id, "Codex account changed; restarting with the original session history");
+        self.reader_state.title_gen.disarm();
+        self.suspend.terminate().await;
+        emit(
+            &self.event_tx,
+            &self.session_id,
+            self.turn_gen.load(Ordering::SeqCst),
+            SessionEvent::BackendSuspended,
+        );
+        *self.stdin.lock().await = None;
+        self.suspend
+            .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+            .await
+            .map_err(resume_failed)
     }
 }
 
@@ -1601,6 +1924,8 @@ async fn reader_task(
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    pending_controls: PendingControls,
+    goal_active: Arc<std::sync::atomic::AtomicBool>,
     pending_steers: Arc<Mutex<HashMap<u64, PendingSteer>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
@@ -1609,6 +1934,7 @@ async fn reader_task(
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
     title_gen: Arc<TitleGen>,
+    authentication: CodexAuthentication,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1715,6 +2041,30 @@ async fn reader_task(
                 let has_id = frame.get("id").is_some();
                 match (method, has_id) {
                     (Some(m), true) => {
+                        if m == "account/chatgptAuthTokens/refresh"
+                            && let Some(provider) = authentication.provider.lock().await.clone()
+                        {
+                            let stdin = stdin.clone();
+                            let id = frame["id"].clone();
+                            let generation = authentication.generation.clone();
+                            let expected_generation = generation.load(Ordering::SeqCst);
+                            // Keep draining stdout while Codex refreshes the selected profile.
+                            tokio::spawn(async move {
+                                let response = match provider.login_params(true).await {
+                                    Ok(mut credentials) => {
+                                        if let Some(object) = credentials.as_object_mut() {
+                                            object.remove("type");
+                                        }
+                                        json!({"jsonrpc":"2.0","id":id,"result":credentials})
+                                    }
+                                    Err(message) => {
+                                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}})
+                                    }
+                                };
+                                write_auth_refresh_response(&stdin, &generation, expected_generation, &response).await;
+                            });
+                            continue;
+                        }
                         // reverse-RPC (ServerRequest): infra → auto-reject to prevent
                         // deadlock (A2/A3); auth-refresh + approvals → surface as
                         // Permission (NOT auto-answered — a human/credential answers).
@@ -1732,8 +2082,17 @@ async fn reader_task(
                     }
                     (Some(m), false) => {
                         // server notification → SessionEvent(s)
-                        let cur = turn_gen.load(Ordering::SeqCst);
+                        let mut cur = turn_gen.load(Ordering::SeqCst);
                         let params = frame.get("params").unwrap_or(&Value::Null);
+                        if m == "thread/goal/updated" {
+                            goal_active.store(
+                                params.pointer("/goal/status").and_then(Value::as_str) == Some("active"),
+                                Ordering::SeqCst,
+                            );
+                        } else if m == "thread/goal/cleared" {
+                            goal_active.store(false, Ordering::SeqCst);
+                        }
+
                         if m == "thread/started" {
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
@@ -1753,6 +2112,10 @@ async fn reader_task(
                             }
                         }
                         if m == "turn/started" {
+                            if goal_active.load(Ordering::SeqCst) && !turn_in_flight.swap(true, Ordering::SeqCst) {
+                                cur = turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                                emit(&event_tx, &session_id, cur, SessionEvent::TurnStarted { epoch: cur });
+                            }
                             terminated = false; // a new turn can terminate once (R8 reset)
                             idle_pending = false; // and a fresh turn has no deferred idle
                             system_error_pending = false; // nor a deferred systemError
@@ -1872,11 +2235,13 @@ async fn reader_task(
                                 system_error_deadline = None;
                                 *active_turn_id.lock().await = None;
                                 turn_in_flight.store(false, Ordering::SeqCst);
-                                let message = params
-                                    .get("error")
-                                    .and_then(|e| e.get("message").and_then(Value::as_str).or_else(|| e.as_str()))
-                                    .unwrap_or("codex reported a fatal error")
-                                    .to_string();
+                                let message = retry_notice_message(params).unwrap_or_else(|| {
+                                    params
+                                        .get("error")
+                                        .and_then(|e| e.get("message").and_then(Value::as_str).or_else(|| e.as_str()))
+                                        .unwrap_or("codex reported a fatal error")
+                                        .to_string()
+                                });
                                 tracing::warn!(
                                     conversation_id = %session_id,
                                     turn_gen = cur,
@@ -1912,6 +2277,23 @@ async fn reader_task(
                         // never a silent drop. Other responses (settings/rollback/etc)
                         // flow via notifications; diagnostic only.
                         if let Some(rid) = frame.get("id").and_then(Value::as_u64) {
+                            if let Some(sender) = pending_controls.lock().await.remove(&rid) {
+                                let result = if let Some(error) = frame.get("error") {
+                                    Err(error
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("Codex rejected the command")
+                                        .to_owned())
+                                } else {
+                                    Ok(frame.get("result").cloned().unwrap_or(Value::Null))
+                                };
+                                let _ = sender.send(result);
+                                continue;
+                            }
+                            if let Some(sender) = authentication.pending.lock().await.remove(&rid) {
+                                let _ = sender.send(frame.get("result").is_some() && frame.get("error").is_none());
+                                continue;
+                            }
                             // Verified: Codex 0.166.0 v2/ThreadStartResponse.json.
                             // Fresh/resumed thread responses report their actual defaults.
                             if let Some(result) = frame.get("result")
@@ -1942,6 +2324,11 @@ async fn reader_task(
                                 let mut pending = pending_resume.lock().await;
                                 match *pending {
                                     Some(prid) if prid == rid => {
+                                        if let Some(msg) = error_message.as_deref() {
+                                            *resume_poison.lock().await =
+                                                Some(format!("codex thread/resume failed: {msg}"));
+                                            *thread_binding.lock().await = None;
+                                        }
                                         *pending = None;
                                         true
                                     }
@@ -1954,8 +2341,6 @@ async fn reader_task(
                                     error = %msg,
                                     "codex thread/resume rejected — clearing poisoned thread binding (dead resume anchor)"
                                 );
-                                *thread_binding.lock().await = None;
-                                *resume_poison.lock().await = Some(format!("codex thread/resume failed: {msg}"));
                                 continue;
                             }
                             // Claim the thread/fork response (pending_resume's
@@ -2836,6 +3221,25 @@ async fn write_reverse_error(
         line.push(b'\n');
         let _ = w.write_all(&line).await;
         let _ = w.flush().await;
+    }
+}
+
+async fn write_auth_refresh_response(
+    stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
+    generation: &AtomicU64,
+    expected_generation: u64,
+    response: &Value,
+) {
+    let mut guard = stdin.lock().await;
+    if generation.load(Ordering::SeqCst) != expected_generation {
+        return;
+    }
+    let Some(writer) = guard.as_mut() else { return };
+    use tokio::io::AsyncWriteExt;
+    if let Ok(mut bytes) = serde_json::to_vec(response) {
+        bytes.push(b'\n');
+        let _ = writer.write_all(&bytes).await;
+        let _ = writer.flush().await;
     }
 }
 
@@ -4001,6 +4405,9 @@ impl SessionBackend for CodexSessionBackend {
     }
 
     async fn dispatch(&self, command: Command) -> Result<CommandReceipt, BackendError> {
+        if matches!(&command, Command::Send { .. }) {
+            self.refresh_account().await?;
+        }
         match command {
             Command::Send { content, metadata } => {
                 // §C6 Layer-2: reject any block kind codex does not advertise
@@ -4032,7 +4439,86 @@ impl SessionBackend for CodexSessionBackend {
                 // commands (builtin_slash_commands) translate to native ops the way
                 // the codex-acp bridge did in-process (v0.14.0 thread.rs:3252
                 // handle_prompt) — codex does NOT interpret slash text itself.
-                let route = route_slash_command(&content);
+                let mut content = content;
+                let mut route = route_slash_command(&content);
+                if let Some(SlashRoute::Plan { mode, input }) = &route {
+                    if self.turn_in_flight.load(Ordering::SeqCst) {
+                        return Err(BackendError::Transport(
+                            "Wait for the current turn before changing planning mode".into(),
+                        ));
+                    }
+                    self.suspend
+                        .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+                        .await?;
+                    let tid = self.bound_thread().await?;
+                    let model = self
+                        .current_model
+                        .lock()
+                        .await
+                        .clone()
+                        .or_else(|| {
+                            self.discovered
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .current_model
+                                .clone()
+                        })
+                        .ok_or_else(|| BackendError::Transport("The current model is not available yet".into()))?;
+                    self.control_rpc("thread/settings/update", json!({"threadId":tid,"collaborationMode":{"mode":mode,"settings":{"model":model,"developer_instructions":null}}})).await?;
+                    if input.is_empty() {
+                        return Ok(self.complete_control(
+                            "CODEX_PLAN_MODE_CHANGED",
+                            "Planning mode updated",
+                            json!({"mode":mode}),
+                        ));
+                    }
+                    content[0] = ContentBlock::Text(input.clone());
+                    route = None;
+                }
+                if let Some(SlashRoute::Goal(input)) = &route {
+                    self.suspend
+                        .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+                        .await?;
+                    let tid = self.bound_thread().await?;
+                    let control = matches!(input.as_str(), "" | "status" | "pause" | "resume" | "clear");
+                    if self.turn_in_flight.load(Ordering::SeqCst)
+                        && !matches!(input.as_str(), "status" | "pause" | "clear")
+                    {
+                        return Err(BackendError::Transport(
+                            "Wait for the current turn before starting a goal".into(),
+                        ));
+                    }
+                    if !control || input == "resume" {
+                        // A real native goal starts its own turn; do not also send turn/start.
+                        // Verified: Catfish .tmp/codex-goal-probe/summary.json (0.167.0 capture).
+                        self.turn_in_flight.store(true, Ordering::SeqCst);
+                        self.goal_active.store(true, Ordering::SeqCst);
+                        let generation = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                        let mut params = json!({"threadId":tid,"status":"active","origin":"user"});
+                        if !control {
+                            params["objective"] = Value::String(input.clone());
+                        }
+                        if let Err(error) = self.control_rpc("thread/goal/set", params).await {
+                            self.goal_active.store(false, Ordering::SeqCst);
+                            self.turn_in_flight.store(false, Ordering::SeqCst);
+                            return Err(error);
+                        }
+                        return Ok(CommandReceipt {
+                            accepted: true,
+                            admission: Admission::Started,
+                            turn_gen: generation,
+                        });
+                    }
+                    let result = match input.as_str() {
+                        "clear" => self.control_rpc("thread/goal/clear", json!({"threadId":tid})).await?,
+                        "pause" => {
+                            self.pause_goal(&tid).await?;
+                            json!({"goal":{"status":"paused"}})
+                        }
+                        _ => self.control_rpc("thread/goal/get", json!({"threadId":tid})).await?,
+                    };
+                    return Ok(self.complete_control("CODEX_GOAL_STATUS", "Goal status updated", json!({"status":result.pointer("/goal/status").and_then(Value::as_str).unwrap_or("none"),"objective":result.pointer("/goal/objective").and_then(Value::as_str).unwrap_or("")})));
+                }
 
                 // /logout → account/logout. No turn lifecycle follows (bridge:
                 // auth.logout() then auth_required), so it is handled before the
@@ -4150,7 +4636,9 @@ impl SessionBackend for CodexSessionBackend {
                     // /review* → review/start{threadId, target} (bridge: Op::Review;
                     // delivery omitted = inline on this thread, the bridge's behavior).
                     Some(SlashRoute::Review(target)) => ("review/start", json!({ "threadId": tid, "target": target })),
-                    Some(SlashRoute::Logout) => unreachable!("handled above"),
+                    Some(SlashRoute::Logout | SlashRoute::Plan { .. } | SlashRoute::Goal(_)) => {
+                        unreachable!("handled above")
+                    }
                 };
                 let frame = json!({
                     "jsonrpc": "2.0",
@@ -4175,6 +4663,8 @@ impl SessionBackend for CodexSessionBackend {
                 // (establishes the handshake completed + lets the reader bind the
                 // active turn from turn/started).
                 let tid = self.bound_thread().await?;
+                // Older CLIs may have no goal API; cancellation must still interrupt.
+                let _ = self.pause_goal(&tid).await;
                 // cancel-before-fold race (token-burn half): a cancel can arrive in the
                 // window between dispatch(Send) (which set turn_in_flight + wrote
                 // turn/start) and the reader binding `active_turn_id` from the async
@@ -4628,6 +5118,19 @@ impl SessionBackend for CodexSessionBackend {
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
                 })
             }
+            Command::SetConfigOption { option_id, value } if option_id == "goal_status" && value == "paused" => {
+                let tid = self.bound_thread().await?;
+                self.pause_goal(&tid).await?;
+                if let Some(turn_id) = self.active_turn_id.lock().await.clone() {
+                    self.control_rpc("turn/interrupt", json!({"threadId":tid,"turnId":turn_id}))
+                        .await?;
+                }
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                })
+            }
             Command::SetConfigOption { option_id, value } if option_id == "service_tier" => {
                 // Verified: tests/fixtures/codex_0.167.0_speed_settings.json:
                 // explicit "default" overrides a globally configured fast tier.
@@ -4774,6 +5277,11 @@ enum SlashRoute {
     Review(Value),
     /// `/logout` → `account/logout` (no turn follows).
     Logout,
+    Plan {
+        mode: String,
+        input: String,
+    },
+    Goal(String),
 }
 
 /// Parse a leading slash command NAME from raw text. Sole grammar owner, shared
@@ -4814,6 +5322,15 @@ fn route_slash_command(content: &[ContentBlock]) -> Option<SlashRoute> {
     // name because the name never contains a multi-byte prefix split), trimmed.
     let rest = text[1 + name.len()..].trim_start();
     match name {
+        "plan" => Some(SlashRoute::Plan {
+            mode: "plan".into(),
+            input: rest.trim().into(),
+        }),
+        "default" => Some(SlashRoute::Plan {
+            mode: "default".into(),
+            input: rest.trim().into(),
+        }),
+        "goal" => Some(SlashRoute::Goal(rest.trim().into())),
         "compact" => Some(SlashRoute::Compact),
         "init" => Some(SlashRoute::Init),
         "review" => {
@@ -5588,7 +6105,7 @@ mod tests {
             concat!(
                 r#"{"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"id":"t1"}}}"#,
                 "\n",
-                r#"{"jsonrpc":"2.0","method":"error","params":{"threadId":"th1","turnId":"t1","willRetry":false,"error":{"message":"boom fatal"}}}"#,
+                r#"{"jsonrpc":"2.0","method":"error","params":{"threadId":"th1","turnId":"t1","willRetry":false,"error":{"message":"Reconnecting... 5/5","additionalDetails":"Selected model is at capacity"}}}"#,
                 "\n",
             )
             .as_bytes()
@@ -5616,8 +6133,8 @@ mod tests {
         .expect("a TurnResult");
         assert!(tr.0, "fatal error in flight → is_error terminal");
         assert!(
-            tr.1.contains("boom fatal"),
-            "the fatal error message rides result_text, got {:?}",
+            tr.1.contains("Reconnecting... 5/5") && tr.1.contains("Selected model is at capacity"),
+            "the fatal headline and capacity detail ride result_text, got {:?}",
             tr.1
         );
     }
@@ -6765,7 +7282,17 @@ mod tests {
         // And the reverse: no name routes that the catalog fails to advertise.
         // Enumerate the full universe the route table recognizes today; if a new
         // arm is added to `route_slash_command`, add it here AND to the catalog.
-        let route_universe = ["review", "review-branch", "review-commit", "init", "compact", "logout"];
+        let route_universe = [
+            "plan",
+            "default",
+            "goal",
+            "review",
+            "review-branch",
+            "review-commit",
+            "init",
+            "compact",
+            "logout",
+        ];
         for name in route_universe {
             assert!(
                 route_slash_command(&[ContentBlock::Text(format!("/{name} arg"))]).is_some(),
@@ -6795,7 +7322,17 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["review", "review-branch", "review-commit", "init", "compact", "logout"]
+            vec![
+                "plan",
+                "default",
+                "goal",
+                "review",
+                "review-branch",
+                "review-commit",
+                "init",
+                "compact",
+                "logout"
+            ]
         );
     }
 
@@ -8364,6 +8901,7 @@ mod tests {
         let frame = thread_resume_params(&config, "th-1").into_frame(2, "thread/resume");
         assert_eq!(frame["method"], "thread/resume");
         assert_eq!(frame["params"]["threadId"], "th-1");
+        assert_eq!(frame["params"]["excludeTurns"], true);
         assert_eq!(frame["params"]["cwd"], "/work");
         assert_eq!(frame["params"]["approvalPolicy"], "never");
         assert_eq!(frame["params"]["sandbox"], "danger-full-access");
@@ -8376,6 +8914,7 @@ mod tests {
         // instructions keys (mirrors the bare thread/start shape).
         let bare = thread_resume_params(&SessionConfig::default(), "th-2").into_frame(3, "thread/resume");
         assert_eq!(bare["params"]["threadId"], "th-2");
+        assert_eq!(bare["params"]["excludeTurns"], true);
         assert!(bare["params"].get("config").is_none());
         assert!(bare["params"].get("developerInstructions").is_none());
         assert!(bare["params"].get("baseInstructions").is_none());
@@ -8435,6 +8974,7 @@ mod tests {
         assert_eq!(
             spec.env
                 .iter()
+                .filter(|entry| entry.name != "CODEX_HOME")
                 .map(|e| (e.name.as_str(), e.value.as_str()))
                 .collect::<Vec<_>>(),
             [("AIONUI_CONVERSATION_ID", "conv-1")],
@@ -9294,6 +9834,230 @@ mod tests {
             backend.resume_poison.lock().await.is_none(),
             "a successful resume must not poison the bound-thread wait"
         );
+    }
+
+    fn account_profiles(root: &std::path::Path, active: &str) -> CodexProfiles {
+        let config_dir = root.join(".config/ai-usage-monitor");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("codex-accounts.json"),
+            json!({"active": active, "accounts": [{"id": "a"}, {"id": "b"}]}).to_string(),
+        )
+        .unwrap();
+        CodexProfiles::from_env(&[
+            aionui_common::EnvVar {
+                name: "USERPROFILE".into(),
+                value: root.to_string_lossy().into_owned(),
+            },
+            aionui_common::EnvVar {
+                name: "HOME".into(),
+                value: root.to_string_lossy().into_owned(),
+            },
+            aionui_common::EnvVar {
+                name: "CODEX_HOME".into(),
+                value: root.join(".codex").to_string_lossy().into_owned(),
+            },
+            aionui_common::EnvVar {
+                name: "CODEX_ACCOUNTS_PATH".into(),
+                value: config_dir.join("codex-accounts.json").to_string_lossy().into_owned(),
+            },
+        ])
+    }
+
+    #[tokio::test]
+    async fn cross_account_resume_uses_the_original_native_history_path() {
+        let root = tempfile::tempdir().unwrap();
+        let profiles = account_profiles(root.path(), "b");
+        let id = uuid::Uuid::new_v4().to_string();
+        let directory = root
+            .path()
+            .join(".config/ai-usage-monitor/codex-accounts/a/sessions/2026/11/10");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("rollout-test-{id}.jsonl"));
+        let history = json!({"type": "session_meta", "payload": {"id": id}}).to_string();
+        std::fs::write(&path, &history).unwrap();
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let mut backend = CodexSessionBackend::build_with_io("account-handoff", Box::new(fake)).await;
+        backend.profiles = Some(profiles);
+        backend.run_handshake(HandshakeMode::Resume(&id)).await.unwrap();
+        let frames: Vec<Value> = captured_str(&captured)
+            .await
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let resume = frames.iter().find(|frame| frame["method"] == "thread/resume").unwrap();
+        assert_eq!(resume["params"]["path"], json!(std::fs::canonicalize(&path).unwrap()));
+        assert!(!frames.iter().any(|frame| frame["method"] == "thread/start"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), history);
+    }
+
+    #[tokio::test]
+    async fn resume_must_be_confirmed_before_the_preseeded_thread_can_accept_work() {
+        let backend =
+            CodexSessionBackend::build_with_io("pending-resume", Box::new(FakeAgentIo::never_exits(Vec::new()))).await;
+        backend.seed_thread_binding_for_test("original").await;
+        backend.register_pending_resume_for_test(7).await;
+        assert!(matches!(
+            backend.bound_thread_within(std::time::Duration::from_millis(1)).await,
+            Err(BackendError::HandshakeTimeout(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_resume_keeps_the_original_anchor_and_never_starts_a_fresh_thread() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(
+            b"{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32600,\"message\":\"no rollout found for thread id original\"}}\n".to_vec(),
+        );
+        let captured = fake.captured_stdin();
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("failed-handoff", Box::new(fake)).await;
+        backend.run_handshake(HandshakeMode::Resume("original")).await.unwrap();
+        release();
+        let error = backend.confirm_resume().await.unwrap_err();
+        assert!(error.to_string().contains("CODEX_SESSION_RESUME_FAILED:"));
+        assert_eq!(backend.resume_anchor.lock().await.as_deref(), Some("original"));
+        assert!(!captured_str(&captured).await.contains("\"method\":\"thread/start\""));
+    }
+
+    #[tokio::test]
+    async fn account_switch_recycles_the_process_with_target_credentials_and_retains_the_anchor() {
+        let root = tempfile::tempdir().unwrap();
+        let profiles = account_profiles(root.path(), "b");
+        let spawner = Arc::new(crate::testing::FakeSpawner::new());
+        let mut backend = CodexSessionBackend::build_with_io_suspending(
+            "account-change",
+            Box::new(FakeAgentIo::never_exits(Vec::new())),
+            spawner.clone(),
+            60_000,
+        )
+        .await;
+        backend.profiles = Some(profiles);
+        *backend.profile_home.lock().await = Some(root.path().join(".config/ai-usage-monitor/codex-accounts/a"));
+        *backend.history_home.lock().await = backend.profile_home.lock().await.clone();
+        backend.seed_thread_binding_for_test("original").await;
+        // FakeSpawner records the real spawn recipe and deliberately refuses to spawn.
+        assert!(backend.refresh_account().await.is_err());
+        let command = spawner.last_command().await.unwrap();
+        assert!(command.env.iter().any(|entry| entry.name == "CODEX_HOME"
+            && std::path::Path::new(&entry.value) == root.path().join(".config/ai-usage-monitor/codex-accounts/a")));
+        assert_eq!(backend.resume_anchor.lock().await.as_deref(), Some("original"));
+        assert!(
+            command
+                .args
+                .iter()
+                .any(|arg| arg == "cli_auth_credentials_store=\"ephemeral\"")
+        );
+    }
+
+    async fn external_auth_backend(
+        root: &std::path::Path,
+        login_ok: bool,
+    ) -> (
+        Arc<CodexSessionBackend>,
+        Arc<Mutex<Vec<u8>>>,
+        Box<dyn Fn() + Send + Sync>,
+    ) {
+        let profile = root.join("account-b");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(
+            profile.join("auth.json"),
+            json!({"tokens":{"access_token":"test-access-token","account_id":"account-b"}}).to_string(),
+        )
+        .unwrap();
+        let response = if login_ok {
+            json!({"id":2,"result":{"type":"chatgptAuthTokens"}})
+        } else {
+            json!({"id":2,"error":{"code":-32600,"message":"authentication rejected"}})
+        };
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(format!("{response}\n").into_bytes());
+        let captured = fake.captured_stdin();
+        let release = fake.stdout_releaser();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("external-auth", Box::new(fake)).await);
+        *backend.authentication.provider.lock().await = Some(CodexAuthProvider::new(
+            profile,
+            Arc::new(crate::testing::FakeSpawner::new()),
+            aionui_common::CommandSpec {
+                command: "codex".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cwd: None,
+            },
+        ));
+        (backend, captured, Box::new(release))
+    }
+
+    #[tokio::test]
+    async fn original_history_is_resumed_only_after_the_selected_account_login_is_confirmed() {
+        let root = tempfile::tempdir().unwrap();
+        let (backend, captured, release) = external_auth_backend(root.path(), true).await;
+        let task = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.run_handshake(HandshakeMode::Resume("original")).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !captured_str(&captured).await.contains("account/login/start") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!captured_str(&captured).await.contains("thread/resume"));
+        release();
+        task.await.unwrap().unwrap();
+        let frames: Vec<Value> = captured_str(&captured)
+            .await
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let login = frames
+            .iter()
+            .position(|frame| frame["method"] == "account/login/start")
+            .unwrap();
+        let resume = frames
+            .iter()
+            .position(|frame| frame["method"] == "thread/resume")
+            .unwrap();
+        assert!(login < resume);
+        assert_eq!(frames[login]["params"]["chatgptAccountId"], "account-b");
+    }
+
+    #[tokio::test]
+    async fn rejected_account_login_does_not_resume_or_create_another_thread() {
+        let root = tempfile::tempdir().unwrap();
+        let (backend, captured, release) = external_auth_backend(root.path(), false).await;
+        let task = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.run_handshake(HandshakeMode::Resume("original")).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !captured_str(&captured).await.contains("account/login/start") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release();
+        let result = task.await.unwrap();
+        assert!(result.is_err());
+        let frames = captured_str(&captured).await;
+        assert!(!frames.contains("thread/resume") && !frames.contains("thread/start"));
+    }
+
+    #[tokio::test]
+    async fn token_refresh_from_a_replaced_process_cannot_reach_the_new_account() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("stale-auth-refresh", Box::new(fake)).await;
+        backend.authentication.generation.store(2, Ordering::SeqCst);
+        write_auth_refresh_response(
+            &backend.stdin,
+            &backend.authentication.generation,
+            1,
+            &json!({"id":3,"result":{"accessToken":"old-account-secret"}}),
+        )
+        .await;
+        assert!(captured_str(&captured).await.is_empty());
     }
 
     /// ELECTRON-3Q0 fix B, NoTurn flavor — an `account/logout` ERROR response has

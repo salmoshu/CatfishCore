@@ -57,7 +57,8 @@ pub trait IAgentTask: Send + Sync {
     fn last_activity_at(&self) -> TimestampMs;
 
     /// Number of live (declared, not yet terminal) background containers —
-    /// workflows, background bashes, background subagents. These outlive their
+    /// workflows, background bashes, background subagents, and client-hosted
+    /// terminals. These outlive their
     /// launching turn by design and emit no mid-flight frames, so `status` and
     /// `last_activity_at` alone misread a busy agent as idle. Backends without
     /// a background-task subsystem report 0.
