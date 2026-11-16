@@ -368,6 +368,7 @@ mod tests {
         assert!(matches!(result, Err(ShellError::FileNotFound(_))));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_show_item_uses_filemanager1_when_gdbus_available() {
         let path = Path::new("/home/user/Downloads/AionUi.deb");
@@ -383,6 +384,7 @@ mod tests {
         assert_eq!(args.last().unwrap(), "");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_show_item_percent_encodes_spaces_in_uri() {
         let path = Path::new("/home/user/My Downloads/AionUi.deb");
@@ -394,6 +396,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_show_item_falls_back_to_parent_dir_without_gdbus() {
         let path = Path::new("/home/user/Downloads/AionUi.deb");
