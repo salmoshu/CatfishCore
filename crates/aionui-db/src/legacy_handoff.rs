@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::{AssertSqlSafe, SqlitePool};
 use tracing::info;
 
 use crate::error::DbError;
@@ -86,7 +86,10 @@ async fn ensure_legacy_handoff_column(pool: &SqlitePool, column: LegacyHandoffCo
         "ALTER TABLE {} ADD COLUMN {} {}",
         column.table, column.column, column.definition
     );
-    sqlx::query(&sql).execute(pool).await.map_err(DbError::Query)?;
+    sqlx::query(AssertSqlSafe(sql))
+        .execute(pool)
+        .await
+        .map_err(DbError::Query)?;
     info!(
         table = column.table,
         column = column.column,

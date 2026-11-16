@@ -1,5 +1,5 @@
 use aionui_common::now_ms;
-use sqlx::SqlitePool;
+use sqlx::{AssertSqlSafe, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
@@ -114,7 +114,7 @@ impl ITeamRepository for SqliteTeamRepository {
             set_clauses.join(", ")
         );
 
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(AssertSqlSafe(sql));
         if let Some(ref name) = params.name {
             query = query.bind(name);
         }
@@ -278,7 +278,7 @@ impl ITeamRepository for SqliteTeamRepository {
                    AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
                  ORDER BY created_at ASC, id ASC"
             );
-            let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql)
+            let mut query = sqlx::query_as::<_, MailboxMessageRow>(AssertSqlSafe(sql))
                 .bind(team_id)
                 .bind(to_agent_id);
             for id in chunk {
@@ -309,7 +309,7 @@ impl ITeamRepository for SqliteTeamRepository {
                  WHERE team_id = ? AND id IN ({placeholders}) \
                    AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?)"
             );
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(AssertSqlSafe(sql));
             query = query.bind(team_id);
             for id in chunk {
                 query = query.bind(id);
@@ -401,7 +401,7 @@ impl ITeamRepository for SqliteTeamRepository {
              ORDER BY created_at {order}, id {order} \
              LIMIT ?"
         );
-        let mut q = sqlx::query_as::<_, MailboxMessageRow>(&sql).bind(team_id);
+        let mut q = sqlx::query_as::<_, MailboxMessageRow>(AssertSqlSafe(sql)).bind(team_id);
         if let Some(c) = &cursor {
             q = q.bind(c.created_at).bind(c.created_at).bind(&c.id);
         }
@@ -425,7 +425,7 @@ impl ITeamRepository for SqliteTeamRepository {
                  WHERE id IN ({placeholders}) \
                  ORDER BY created_at DESC"
             );
-            let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql);
+            let mut query = sqlx::query_as::<_, MailboxMessageRow>(AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -534,7 +534,7 @@ impl ITeamRepository for SqliteTeamRepository {
             set_clauses.join(", ")
         );
 
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(AssertSqlSafe(sql));
         if let Some(ref status) = params.status {
             query = query.bind(status);
         }
@@ -597,7 +597,9 @@ impl ITeamRepository for SqliteTeamRepository {
                    AND id IN ({placeholders}) \
                  ORDER BY created_at DESC"
             );
-            let mut q = sqlx::query_as::<_, TeamTaskRow>(&sql).bind(team_id).bind(user_id);
+            let mut q = sqlx::query_as::<_, TeamTaskRow>(AssertSqlSafe(sql))
+                .bind(team_id)
+                .bind(user_id);
             for id in chunk {
                 q = q.bind(id);
             }
@@ -631,7 +633,9 @@ impl ITeamRepository for SqliteTeamRepository {
              ORDER BY created_at {order}, id {order} \
              LIMIT ?"
         );
-        let mut q = sqlx::query_as::<_, TeamTaskRow>(&sql).bind(team_id).bind(user_id);
+        let mut q = sqlx::query_as::<_, TeamTaskRow>(AssertSqlSafe(sql))
+            .bind(team_id)
+            .bind(user_id);
         if let Some(c) = &cursor {
             q = q.bind(c.created_at).bind(c.created_at).bind(&c.id);
         }

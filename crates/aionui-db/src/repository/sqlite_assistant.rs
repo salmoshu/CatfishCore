@@ -1,7 +1,7 @@
 //! SQLite-backed assistant repositories.
 
 use aionui_common::{TimestampMs, now_ms};
-use sqlx::SqlitePool;
+use sqlx::{AssertSqlSafe, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::{
@@ -523,7 +523,7 @@ impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
 
         let placeholders = std::iter::repeat_n("?", valid_ids.len()).collect::<Vec<_>>().join(",");
         let sql = format!("DELETE FROM assistant_overrides WHERE user_id = ? AND assistant_id NOT IN ({placeholders})");
-        let mut q = sqlx::query(&sql).bind(user_id);
+        let mut q = sqlx::query(AssertSqlSafe(sql)).bind(user_id);
         for id in valid_ids {
             q = q.bind(*id);
         }

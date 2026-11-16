@@ -19,7 +19,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 /// pending, so `_sqlx_migrations` max version == 29), then run each `seed`
 /// statement in order. Closes the pool before returning so the caller can open
 /// it via the staged-init path.
-async fn build_v29_db(path: &Path, seed: &[&str]) {
+async fn build_v29_db(path: &Path, seed: &[&'static str]) {
     let url = format!("sqlite://{}?mode=rwc", path.display());
     let pool = SqlitePoolOptions::new().max_connections(1).connect(&url).await.unwrap();
     sqlx::query("PRAGMA foreign_keys = OFF").execute(&pool).await.unwrap();
@@ -35,9 +35,10 @@ async fn build_v29_db(path: &Path, seed: &[&str]) {
         ignore_missing: false,
         locking: true,
         no_tx: false,
+        ..full
     };
     migrator.run(&pool).await.unwrap();
-    for sql in seed {
+    for &sql in seed {
         sqlx::query(sql).execute(&pool).await.unwrap();
     }
     sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&pool).await.ok();
@@ -49,7 +50,7 @@ async fn build_v29_db(path: &Path, seed: &[&str]) {
 /// stopped at v29 (AionCore 0.1.52 stops at 28) jumps straight to a build with
 /// 030. Staged init must run the repair before the migrator applies 029 + 030 in
 /// a single pass — the path the old `== 29` gate skipped entirely.
-async fn build_db_through(path: &Path, through_version: i64, seed: &[&str]) {
+async fn build_db_through(path: &Path, through_version: i64, seed: &[&'static str]) {
     let url = format!("sqlite://{}?mode=rwc", path.display());
     let pool = SqlitePoolOptions::new().max_connections(1).connect(&url).await.unwrap();
     sqlx::query("PRAGMA foreign_keys = OFF").execute(&pool).await.unwrap();
@@ -65,9 +66,10 @@ async fn build_db_through(path: &Path, through_version: i64, seed: &[&str]) {
         ignore_missing: false,
         locking: true,
         no_tx: false,
+        ..full
     };
     migrator.run(&pool).await.unwrap();
-    for sql in seed {
+    for &sql in seed {
         sqlx::query(sql).execute(&pool).await.unwrap();
     }
     sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&pool).await.ok();

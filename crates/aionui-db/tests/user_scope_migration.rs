@@ -7,7 +7,8 @@ use sqlx::migrate::Migrator;
 use sqlx::sqlite::SqlitePoolOptions;
 
 async fn table_columns(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {
-    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+    let rows = sqlx::query("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+        .bind(table)
         .fetch_all(pool)
         .await
         .unwrap();
@@ -15,7 +16,8 @@ async fn table_columns(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {
 }
 
 async fn table_indexes(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {
-    let rows = sqlx::query(&format!("PRAGMA index_list({table})"))
+    let rows = sqlx::query("SELECT name FROM pragma_index_list(?) ORDER BY seq")
+        .bind(table)
         .fetch_all(pool)
         .await
         .unwrap();
@@ -36,6 +38,7 @@ async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
         ignore_missing: false,
         locking: true,
         no_tx: false,
+        ..full
     };
     migrator.run(pool).await.unwrap();
 }
@@ -57,6 +60,7 @@ async fn run_migration_result(pool: &sqlx::SqlitePool, version: i64) -> Result<(
         ignore_missing: true,
         locking: true,
         no_tx: false,
+        ..full
     };
     migrator.run(pool).await
 }
@@ -231,7 +235,11 @@ async fn migration_030_backfills_existing_independent_roots_to_default_user() {
         ("cron_jobs", "id", "cron_legacy", "user_id"),
     ] {
         let sql = format!("SELECT {scope_column} FROM {table} WHERE {id_column} = ?");
-        let owner: String = sqlx::query_scalar(&sql).bind(id_value).fetch_one(&pool).await.unwrap();
+        let owner: String = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(id_value)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(
             owner, "system_default_user",
             "{table}.{scope_column} was not backfilled"
@@ -344,7 +352,11 @@ async fn migration_030_classifies_global_and_user_catalog_rows() {
         ("skills", "id", "skill_extension_legacy", Some("system_default_user")),
     ] {
         let sql = format!("SELECT user_id FROM {table} WHERE {id_column} = ?");
-        let owner: Option<String> = sqlx::query_scalar(&sql).bind(id_value).fetch_one(&pool).await.unwrap();
+        let owner: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(id_value)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(
             owner.as_deref(),
             expected_owner,
@@ -514,7 +526,11 @@ async fn migration_030_preserves_valid_aggregate_child_rows() {
         ("team_tasks", "id", "task_parent"),
     ] {
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE {id_column} = ?");
-        let count: i64 = sqlx::query_scalar(&sql).bind(id_value).fetch_one(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(id_value)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(count, 1, "{table} row was not preserved");
     }
 

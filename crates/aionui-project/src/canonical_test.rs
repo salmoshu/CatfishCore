@@ -8,7 +8,7 @@ fn uri(path: &str) -> String {
 
 #[cfg(not(windows))]
 fn uri(path: &str) -> String {
-    path.to_owned()
+    to_file_uri(Path::new(path)).unwrap()
 }
 
 #[test]

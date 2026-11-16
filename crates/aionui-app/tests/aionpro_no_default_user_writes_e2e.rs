@@ -48,12 +48,17 @@ async fn aionpro_startup_writes_no_system_default_user_rows() {
             if column != "user_id" && column != "owner_user_id" {
                 continue;
             }
-            let count: i64 = sqlx::query_scalar(&format!(
-                "SELECT COUNT(*) FROM \"{table}\" WHERE \"{column}\" = 'system_default_user'"
-            ))
-            .fetch_one(pool)
-            .await
-            .unwrap();
+            // Both identifiers come from SQLite metadata; escape embedded quotes
+            // before interpolation because SQLite does not bind identifiers.
+            let sql = format!(
+                "SELECT COUNT(*) FROM \"{}\" WHERE \"{}\" = 'system_default_user'",
+                table.replace('"', "\"\""),
+                column.replace('"', "\"\"")
+            );
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .fetch_one(pool)
+                .await
+                .unwrap();
             if count > 0 {
                 offenders.push(format!("{table}.{column} = {count} row(s)"));
             }

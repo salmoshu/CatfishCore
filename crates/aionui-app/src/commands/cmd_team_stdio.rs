@@ -22,7 +22,7 @@ use crate::commands::error::{CliBoundaryCode, CliBoundaryError, missing_env, par
 use aionui_api_types::TeamMcpStdioConfig;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ListToolsResult, Tool};
+use rmcp::model::{CallToolResult, ContentBlock, ListToolsResult, Tool};
 use rmcp::{schemars, service::ServiceExt, tool, tool_router, transport};
 use serde::Deserialize;
 use tokio::net::TcpStream;
@@ -712,7 +712,7 @@ fn tool_response_unexpected() -> CliBoundaryError {
 }
 
 fn tool_success(text: String) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(text)])
+    CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
 fn tool_error(
@@ -732,7 +732,7 @@ fn tool_error(
         structured["domainCode"] = domain_code;
     }
 
-    let mut result = CallToolResult::error(vec![Content::text(message)]);
+    let mut result = CallToolResult::error(vec![ContentBlock::text(message)]);
     result.structured_content = Some(structured);
     result
 }

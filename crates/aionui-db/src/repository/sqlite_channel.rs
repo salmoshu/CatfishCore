@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::{AssertSqlSafe, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
@@ -97,7 +97,7 @@ impl IChannelRepository for SqliteChannelRepository {
         );
 
         let now = aionui_common::now_ms();
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(AssertSqlSafe(sql));
 
         if let Some(ref status) = params.status {
             query = query.bind(status);

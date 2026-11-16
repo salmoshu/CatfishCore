@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::{AssertSqlSafe, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::{ExternalUserProjection, User, UserStatus, UserType};
@@ -250,10 +250,13 @@ impl IUserRepository for SqliteUserRepository {
             // skips rows that would collide with the new owner's existing rows on
             // per-user PK/UNIQUE tables (e.g. `system_settings.user_id`).
             for (table,) in &tables {
-                let result = sqlx::query(&format!(
-                    "UPDATE OR IGNORE \"{table}\" SET \"{owner_column}\" = ? \
+                // The table name comes from sqlite_master; quote embedded double
+                // quotes as SQL identifiers. owner_column is a fixed whitelist.
+                let quoted_table = table.replace('"', "\"\"");
+                let result = sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE OR IGNORE \"{quoted_table}\" SET \"{owner_column}\" = ? \
                      WHERE \"{owner_column}\" = 'system_default_user'"
-                ))
+                )))
                 .bind(owner_id)
                 .execute(&mut *tx)
                 .await?;
@@ -868,6 +871,32 @@ mod tests {
         // Self-idempotent: the source set is now empty.
         let moved_again = repo.adopt_system_default_data(&user.id).await.unwrap();
         assert_eq!(moved_again, 0);
+    }
+
+    #[tokio::test]
+    async fn adopt_quotes_discovered_table_names() {
+        let (repo, db) = setup().await;
+        sqlx::query(r#"CREATE TABLE "legacy""quoted" (user_id TEXT)"#)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(r#"INSERT INTO "legacy""quoted" VALUES ('system_default_user')"#)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let user = repo
+            .ensure_external_user(UserType::Aionpro, "ext-quoted-table", ExternalUserProjection::default())
+            .await
+            .unwrap();
+
+        let moved = repo.adopt_system_default_data(&user.id).await.unwrap();
+
+        assert!(moved >= 1);
+        let owner: String = sqlx::query_scalar(r#"SELECT user_id FROM "legacy""quoted""#)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(owner, user.id);
     }
 
     #[tokio::test]

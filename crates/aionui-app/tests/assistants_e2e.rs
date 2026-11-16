@@ -218,17 +218,14 @@ async fn fixture() -> Fixture {
     let db = init_database_memory().await.unwrap();
     let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
     let (mut states, _): (ModuleStates, _) = build_module_states(&services).await.expect("build module states");
-    for table in [
-        "assistant_preferences",
-        "assistant_overlays",
-        "assistant_definitions",
-        "assistant_overrides",
-        "assistants",
+    for statement in [
+        "DELETE FROM assistant_preferences",
+        "DELETE FROM assistant_overlays",
+        "DELETE FROM assistant_definitions",
+        "DELETE FROM assistant_overrides",
+        "DELETE FROM assistants",
     ] {
-        sqlx::query(&format!("DELETE FROM {table}"))
-            .execute(services.database.pool())
-            .await
-            .unwrap();
+        sqlx::query(statement).execute(services.database.pool()).await.unwrap();
     }
 
     // Replace the extension + hub + skill states with freshly-constructed

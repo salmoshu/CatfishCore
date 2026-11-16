@@ -31,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 license = "MIT"
 
@@ -105,8 +105,8 @@ clap = { version = "4", features = ["derive"] }
 rpassword = "7"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # Auth / Crypto
 jsonwebtoken = "9"
@@ -144,7 +144,7 @@ include_dir = "0.7"
 notify = "8"
 walkdir = "2"
 ignore = "0.4"
-zip = "2"
+zip = "9"
 git2 = { version = "0.21.0", default-features = false }
 # Source-control discard sends untracked files to the platform trash instead of
 # unlinking them (mac/win/linux, x64 + arm64).
@@ -154,7 +154,7 @@ rust-embed = "8"
 
 # Runtime embedding
 fs2 = "0.4"
-zstd = "0.13"
+zstd = "0.14"
 
 # Cron
 cron = "0.15"
@@ -173,8 +173,8 @@ which = "7"
 arboard = { version = "3", default-features = false }
 
 # Office
-calamine = "0.36"
-rust_xlsxwriter = "0.82"
+calamine = "0.38"
+rust_xlsxwriter = "0.102"
 sha1 = "0.10"
 sha2 = "0.10"
 
@@ -187,8 +187,8 @@ aws-sdk-bedrockruntime = { version = "1", default-features = false, features = [
 rustls = "0.23"
 rustls-native-certs = "0.8"
 
-# Pin rustls-webpki to fix RUSTSEC-2026-{0098,0099,0104}
-rustls-webpki = "0.103.13"
+# Keep rustls-webpki on patched 0.103.x releases.
+rustls-webpki = "0.103.16"
 
 # OAuth / MCP
 oauth2 = "5.0.0-rc.1"
@@ -223,4 +223,10 @@ incremental = false
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
 incremental = false
+
+# SQLx 0.9.0 predates the patched libsqlite3-sys 0.39 release. Use only the
+# upstream compatibility fix until a SQLx release includes it.
+[patch.crates-io]
+sqlx-core = { git = "https://github.com/launchbadge/sqlx.git", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx.git", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
 

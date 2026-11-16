@@ -1,5 +1,5 @@
 use aionui_common::{TimestampMs, generate_prefixed_id, now_ms};
-use sqlx::SqlitePool;
+use sqlx::{AssertSqlSafe, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::CronJobRow;
@@ -480,7 +480,7 @@ impl SqliteCronRepository {
             format!("UPDATE cron_jobs SET {} WHERE id = ?", set_parts.join(", "))
         };
 
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(AssertSqlSafe(sql));
         for bind in &binds {
             query = bind_value(query, bind);
         }
@@ -509,9 +509,9 @@ enum BindValue {
 }
 
 fn bind_value<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     val: &'q BindValue,
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
     match val {
         BindValue::Str(s) => query.bind(s.as_str()),
         BindValue::OptStr(s) => query.bind(s.as_deref()),

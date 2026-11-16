@@ -1,5 +1,5 @@
 use aionui_common::{generate_prefixed_id, now_ms};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::{FolderRow, ProjectExplorerRow, ProjectKind, ProjectRow};
@@ -40,9 +40,9 @@ impl IProjectStore for SqliteProjectStore {
         .execute(&self.pool)
         .await?;
 
-        let row = sqlx::query_as::<_, FolderRow>(&format!(
+        let row = sqlx::query_as::<_, FolderRow>(AssertSqlSafe(format!(
             "SELECT {FOLDER_COLS} FROM folders WHERE resource_canonical = ?"
-        ))
+        )))
         .bind(canonical)
         .fetch_one(&self.pool)
         .await?;
@@ -50,17 +50,19 @@ impl IProjectStore for SqliteProjectStore {
     }
 
     async fn get_folder(&self, folder_id: &str) -> Result<Option<FolderRow>, DbError> {
-        let row = sqlx::query_as::<_, FolderRow>(&format!("SELECT {FOLDER_COLS} FROM folders WHERE folder_id = ?"))
-            .bind(folder_id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query_as::<_, FolderRow>(AssertSqlSafe(format!(
+            "SELECT {FOLDER_COLS} FROM folders WHERE folder_id = ?"
+        )))
+        .bind(folder_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
 
     async fn get_project(&self, user_id: &str, project_id: &str) -> Result<Option<ProjectRow>, DbError> {
-        let row = sqlx::query_as::<_, ProjectRow>(&format!(
+        let row = sqlx::query_as::<_, ProjectRow>(AssertSqlSafe(format!(
             "SELECT {PROJECT_COLS} FROM projects WHERE project_id = ? AND user_id = ?"
-        ))
+        )))
         .bind(project_id)
         .bind(user_id)
         .fetch_optional(&self.pool)
@@ -73,10 +75,10 @@ impl IProjectStore for SqliteProjectStore {
         user_id: &str,
         folder_id: &str,
     ) -> Result<Option<ProjectExplorerRow>, DbError> {
-        let row = sqlx::query_as::<_, ProjectExplorerRow>(&format!(
+        let row = sqlx::query_as::<_, ProjectExplorerRow>(AssertSqlSafe(format!(
             "SELECT {ENTRY_COLS} FROM project_explorer \
              WHERE folder_id = ? AND role = 'workspace' AND owner_user_id = ?"
-        ))
+        )))
         .bind(folder_id)
         .bind(user_id)
         .fetch_optional(&self.pool)
@@ -85,9 +87,9 @@ impl IProjectStore for SqliteProjectStore {
     }
 
     async fn get_entry(&self, user_id: &str, pe_id: &str) -> Result<Option<ProjectExplorerRow>, DbError> {
-        let row = sqlx::query_as::<_, ProjectExplorerRow>(&format!(
+        let row = sqlx::query_as::<_, ProjectExplorerRow>(AssertSqlSafe(format!(
             "SELECT {ENTRY_COLS} FROM project_explorer WHERE pe_id = ? AND owner_user_id = ?"
-        ))
+        )))
         .bind(pe_id)
         .bind(user_id)
         .fetch_optional(&self.pool)

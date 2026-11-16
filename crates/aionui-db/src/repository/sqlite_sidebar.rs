@@ -1,4 +1,4 @@
-use sqlx::{Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::ConversationRow;
@@ -69,7 +69,10 @@ impl ISidebarStore for SqliteSidebarStore {
              FROM conversations \
              WHERE user_id = ? AND {archived} AND {HEALTH_CHECK_KEEP}"
         );
-        let rows = sqlx::query(&sql).bind(user_id).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(AssertSqlSafe(sql))
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -93,7 +96,10 @@ impl ISidebarStore for SqliteSidebarStore {
              FROM teams \
              WHERE user_id = ? AND {archived}"
         );
-        let rows = sqlx::query(&sql).bind(user_id).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(AssertSqlSafe(sql))
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -144,7 +150,7 @@ impl ISidebarStore for SqliteSidebarStore {
              WHERE user_id = ? AND {archived} AND {HEALTH_CHECK_KEEP} AND id IN ({})",
             placeholders(ids.len())
         );
-        let mut query = sqlx::query_as::<_, ConversationRow>(&sql);
+        let mut query = sqlx::query_as::<_, ConversationRow>(AssertSqlSafe(sql));
         query = query.bind(user_id);
         for id in ids {
             query = query.bind(id);

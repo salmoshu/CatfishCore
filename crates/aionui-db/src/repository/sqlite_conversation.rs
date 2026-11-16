@@ -1,7 +1,7 @@
 #[path = "sqlite_conversation_fork.rs"]
 mod fork;
 
-use sqlx::{Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlitePool};
 
 use aionui_common::{PaginatedResult, TimestampMs};
 
@@ -412,7 +412,7 @@ impl IConversationRepository for SqliteConversationRepository {
             set_parts.join(", ")
         );
 
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(AssertSqlSafe(sql));
         for bind in &binds {
             query = bind_value(query, bind);
         }
@@ -476,7 +476,7 @@ impl IConversationRepository for SqliteConversationRepository {
 
         // Count total matching rows (without cursor filter for total)
         let count_sql = build_count_sql(user_id, filters);
-        let total = execute_count(&self.pool, &count_sql.0, &count_sql.1).await?;
+        let total = execute_count(&self.pool, count_sql.0, &count_sql.1).await?;
 
         // Fetch page
         let sql = format!(
@@ -486,7 +486,7 @@ impl IConversationRepository for SqliteConversationRepository {
              LIMIT ?"
         );
 
-        let mut query = sqlx::query_as::<_, ConversationRow>(&sql);
+        let mut query = sqlx::query_as::<_, ConversationRow>(AssertSqlSafe(sql));
         for bind in &binds {
             query = bind_value_as(query, bind);
         }
@@ -577,7 +577,7 @@ impl IConversationRepository for SqliteConversationRepository {
         binds.push(BindValue::I64(i64::from(params.limit.max(1))));
         binds.push(BindValue::I64(i64::from(params.offset)));
 
-        let mut query = sqlx::query_as::<_, ConversationRow>(&sql);
+        let mut query = sqlx::query_as::<_, ConversationRow>(AssertSqlSafe(sql));
         for bind in &binds {
             query = bind_value_as(query, bind);
         }
@@ -1027,7 +1027,7 @@ impl IConversationRepository for SqliteConversationRepository {
             set_parts.join(", ")
         );
 
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(AssertSqlSafe(sql));
         for bind in &binds {
             query = bind_value(query, bind);
         }
@@ -1547,9 +1547,9 @@ fn escape_like_pattern(term: &str) -> String {
 
 /// Binds a `BindValue` to a raw `sqlx::query::Query`.
 fn bind_value<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     val: &'q BindValue,
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
     match val {
         BindValue::Str(s) => query.bind(s.as_str()),
         BindValue::OptStr(s) => query.bind(s.as_deref()),
@@ -1561,9 +1561,9 @@ fn bind_value<'q>(
 
 /// Binds a `BindValue` to a `sqlx::query::QueryAs`.
 fn bind_value_as<'q, T>(
-    query: sqlx::query::QueryAs<'q, sqlx::Sqlite, T, sqlx::sqlite::SqliteArguments<'q>>,
+    query: sqlx::query::QueryAs<'q, sqlx::Sqlite, T, sqlx::sqlite::SqliteArguments>,
     val: &'q BindValue,
-) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, T, sqlx::sqlite::SqliteArguments<'q>> {
+) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, T, sqlx::sqlite::SqliteArguments> {
     match val {
         BindValue::Str(s) => query.bind(s.as_str()),
         BindValue::OptStr(s) => query.bind(s.as_deref()),
@@ -1612,8 +1612,8 @@ fn build_count_sql(user_id: &str, filters: &ConversationFilters) -> (String, Vec
 }
 
 /// Executes a dynamic count query.
-async fn execute_count(pool: &SqlitePool, sql: &str, binds: &[BindValue]) -> Result<u64, DbError> {
-    let mut query = sqlx::query_as::<_, (i64,)>(sql);
+async fn execute_count(pool: &SqlitePool, sql: String, binds: &[BindValue]) -> Result<u64, DbError> {
+    let mut query = sqlx::query_as::<_, (i64,)>(AssertSqlSafe(sql));
     for bind in binds {
         query = bind_value_as(query, bind);
     }

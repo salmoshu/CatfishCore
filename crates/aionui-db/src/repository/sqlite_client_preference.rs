@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::{AssertSqlSafe, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::ClientPreference;
@@ -40,7 +40,7 @@ impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
             placeholders.join(", ")
         );
 
-        let mut query = sqlx::query_as::<_, ClientPreference>(&sql).bind(user_id);
+        let mut query = sqlx::query_as::<_, ClientPreference>(AssertSqlSafe(sql)).bind(user_id);
         for key in keys {
             query = query.bind(*key);
         }
@@ -90,7 +90,7 @@ impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
             placeholders.join(", ")
         );
 
-        let mut query = sqlx::query(&sql).bind(user_id);
+        let mut query = sqlx::query(AssertSqlSafe(sql)).bind(user_id);
         for key in keys {
             query = query.bind(*key);
         }

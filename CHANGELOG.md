@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.6](https://github.com/salmoshu/CatfishCore/releases/tag/v0.2.6) (2026-11-16)
+
+### Bug Fixes
+
+- **security:** upgrade SQLite, SQLx, ZIP, compression, spreadsheet, MCP, and TLS dependencies to resolve known vulnerabilities
+- **database:** preserve bound values and validate metadata-derived SQL identifiers during the SQLx 0.9 migration
+- **project:** make file-URI canonical tests platform-independent
+
 ## [0.2.5](https://github.com/salmoshu/CatfishCore/releases/tag/v0.2.5) (2026-11-16)
 
 ### Features

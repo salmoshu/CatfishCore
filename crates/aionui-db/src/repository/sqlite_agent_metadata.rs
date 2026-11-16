@@ -1,7 +1,7 @@
 //! SQLite-backed agent metadata repository.
 
 use aionui_common::now_ms;
-use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
+use sqlx::{AssertSqlSafe, Row, SqlitePool, sqlite::SqliteRow};
 use tracing::warn;
 
 use crate::error::DbError;
@@ -256,12 +256,12 @@ impl SqliteAgentMetadataRepository {
 
     async fn fetch_optional_safe_three_binds(
         &self,
-        sql: &str,
+        sql: String,
         first: &str,
         second: &str,
         third: &str,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
-        let row = sqlx::query(sql)
+        let row = sqlx::query(AssertSqlSafe(sql))
             .bind(first)
             .bind(second)
             .bind(third)
@@ -275,11 +275,11 @@ impl SqliteAgentMetadataRepository {
 
     async fn fetch_optional_safe_two_binds(
         &self,
-        sql: &str,
+        sql: String,
         first: &str,
         second: &str,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
-        let row = sqlx::query(sql)
+        let row = sqlx::query(AssertSqlSafe(sql))
             .bind(first)
             .bind(second)
             .fetch_optional(&self.pool)
@@ -340,7 +340,7 @@ impl SqliteAgentMetadataRepository {
                 "UPDATE agent_metadata SET {} = NULL, updated_at = ? WHERE agent_id = ?",
                 field.column_name()
             );
-            let catalog = sqlx::query(&catalog_sql)
+            let catalog = sqlx::query(AssertSqlSafe(catalog_sql))
                 .bind(now_ms())
                 .bind(id)
                 .execute(&self.pool)
@@ -373,7 +373,10 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
              WHERE am.user_id IS NULL OR am.user_id = ?
              ORDER BY am.sort_order ASC, am.name ASC"
         );
-        let rows = sqlx::query(&sql).bind(user_id).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(AssertSqlSafe(sql))
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
         let mut decoded = Vec::with_capacity(rows.len());
         for row in rows {
             decoded.push(self.decode_and_repair(row).await?);
@@ -387,7 +390,7 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
 
     async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         self.fetch_optional_safe_two_binds(
-            &format!(
+            format!(
                 "SELECT {AGENT_METADATA_SAFE_COLUMNS} {AGENT_METADATA_FROM}
                  WHERE am.agent_id = ? AND (am.user_id IS NULL OR am.user_id = ?)"
             ),
@@ -413,7 +416,7 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         name: &str,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         self.fetch_optional_safe_three_binds(
-            &format!(
+            format!(
                 "SELECT {AGENT_METADATA_SAFE_COLUMNS} {AGENT_METADATA_FROM}
                  WHERE am.agent_source = ? AND am.name = ? AND (am.user_id IS NULL OR am.user_id = ?)
                  ORDER BY am.sort_order ASC, am.name ASC
@@ -436,7 +439,7 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         backend: &str,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         self.fetch_optional_safe_two_binds(
-            &format!(
+            format!(
                 "SELECT {AGENT_METADATA_SAFE_COLUMNS} {AGENT_METADATA_FROM}
                  WHERE am.agent_source = 'builtin'
                    AND am.backend = ?
@@ -722,7 +725,7 @@ impl SqliteAgentMetadataRepository {
              WHERE agent_metadata.user_id IS excluded.user_id"
         );
 
-        sqlx::query(&sql)
+        sqlx::query(AssertSqlSafe(sql))
             .bind(params.id)
             .bind(user_id)
             .bind(params.icon)
@@ -803,8 +806,18 @@ mod tests {
             ),
             "test helper only corrupts rebuildable handshake/cache fields"
         );
+        assert!(
+            !bytes_hex.is_empty()
+                && bytes_hex.len().is_multiple_of(2)
+                && bytes_hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "test helper accepts only complete hexadecimal byte pairs"
+        );
         let sql = format!("UPDATE agent_metadata SET {field} = CAST(x'{bytes_hex}' AS TEXT) WHERE agent_id = ?");
-        sqlx::query(&sql).bind(id).execute(db.pool()).await.unwrap();
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
     }
 
     async fn cache_field_blob(db: &crate::Database, id: &str, field: &str) -> Option<Vec<u8>> {
@@ -821,7 +834,7 @@ mod tests {
             "test helper only reads rebuildable handshake/cache fields"
         );
         let sql = format!("SELECT CAST({field} AS BLOB) FROM agent_metadata WHERE agent_id = ?");
-        sqlx::query_scalar::<_, Option<Vec<u8>>>(&sql)
+        sqlx::query_scalar::<_, Option<Vec<u8>>>(AssertSqlSafe(sql))
             .bind(id)
             .fetch_one(db.pool())
             .await

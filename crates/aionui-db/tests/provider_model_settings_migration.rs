@@ -17,6 +17,7 @@ async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
         ignore_missing: false,
         locking: true,
         no_tx: false,
+        ..full
     }
     .run(pool)
     .await

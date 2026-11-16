@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value, json};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlitePool};
 
 use crate::error::DbError;
 use crate::repository::diagnostics::{
@@ -547,15 +547,12 @@ impl SqliteFeedbackDiagnosticsRepository {
         }
         query.push_str(" ORDER BY updated_at DESC LIMIT 20");
 
-        let rows = if let Some(provider_id) = provider_id.as_deref() {
-            sqlx::query(&query)
-                .bind(&request.user_id)
-                .bind(provider_id)
-                .fetch_all(&self.pool)
-                .await?
-        } else {
-            sqlx::query(&query).bind(&request.user_id).fetch_all(&self.pool).await?
-        };
+        // Only fixed SQL fragments and placeholders are concatenated above.
+        let mut query = sqlx::query(AssertSqlSafe(query)).bind(&request.user_id);
+        if let Some(provider_id) = provider_id.as_deref() {
+            query = query.bind(provider_id);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
 
         let providers = rows
             .into_iter()
@@ -749,15 +746,12 @@ impl SqliteFeedbackDiagnosticsRepository {
         }
         query.push_str(" ORDER BY updated_at DESC LIMIT 30");
 
-        let rows = if let Some(mcp_server_id) = request.context.mcp_server_id.as_deref() {
-            sqlx::query(&query)
-                .bind(&request.user_id)
-                .bind(mcp_server_id)
-                .fetch_all(&self.pool)
-                .await?
-        } else {
-            sqlx::query(&query).bind(&request.user_id).fetch_all(&self.pool).await?
-        };
+        // Only fixed SQL fragments and placeholders are concatenated above.
+        let mut query = sqlx::query(AssertSqlSafe(query)).bind(&request.user_id);
+        if let Some(mcp_server_id) = request.context.mcp_server_id.as_deref() {
+            query = query.bind(mcp_server_id);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
 
         let servers = rows
             .into_iter()

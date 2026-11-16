@@ -18,6 +18,7 @@ async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
         ignore_missing: false,
         locking: true,
         no_tx: false,
+        ..full
     };
     migrator.run(pool).await.unwrap();
 }
@@ -35,6 +36,7 @@ async fn run_migration(pool: &sqlx::SqlitePool, version: i64) {
         ignore_missing: true,
         locking: true,
         no_tx: false,
+        ..full
     };
     migrator.run(pool).await.unwrap();
 }

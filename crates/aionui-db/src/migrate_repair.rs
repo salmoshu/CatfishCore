@@ -69,7 +69,7 @@ async fn should_run_user_scope_repair(conn: &mut sqlx::SqliteConnection) -> Resu
 /// the violated ones with counts. Task 2/3 fills in the guard list.
 async fn evaluate_user_scope_guards(conn: &mut sqlx::SqliteConnection) -> Result<Vec<GuardViolation>, DbError> {
     let mut violations = Vec::new();
-    for (check, count_sql) in GUARD_COUNT_QUERIES {
+    for &(check, count_sql) in GUARD_COUNT_QUERIES {
         match sqlx::query_scalar::<_, i64>(count_sql).fetch_one(&mut *conn).await {
             Ok(count) => {
                 if count > 0 {
@@ -105,7 +105,7 @@ fn is_missing_object_error(err: &sqlx::Error) -> bool {
 /// Execute one idempotent repair statement, tolerating a missing-object error
 /// (the statement is not applicable to the current schema). See
 /// [`is_missing_object_error`].
-async fn exec_repair(conn: &mut sqlx::SqliteConnection, sql: &str) -> Result<(), DbError> {
+async fn exec_repair(conn: &mut sqlx::SqliteConnection, sql: &'static str) -> Result<(), DbError> {
     match sqlx::query(sql).execute(&mut *conn).await {
         Ok(_) => Ok(()),
         Err(e) if is_missing_object_error(&e) => Ok(()),

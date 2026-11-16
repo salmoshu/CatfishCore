@@ -1,5 +1,5 @@
 use aionui_common::now_ms;
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::{AssertSqlSafe, SqliteConnection, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::{OrderItemType, OrderScene, UserOrderRow};
@@ -198,12 +198,12 @@ impl IUserOrderStore for SqliteUserOrderStore {
         // idx_user_order_scene.
         let rows = match after {
             None => {
-                sqlx::query_as::<_, UserOrderRow>(&format!(
+                sqlx::query_as::<_, UserOrderRow>(AssertSqlSafe(format!(
                     "SELECT {USER_ORDER_COLS} FROM user_order \
                      WHERE user_id = ? AND scene = ? \
                      ORDER BY order_key ASC, item_type ASC, item_id ASC \
                      LIMIT ?"
-                ))
+                )))
                 .bind(user_id)
                 .bind(scene.as_str())
                 .bind(limit)
@@ -211,7 +211,7 @@ impl IUserOrderStore for SqliteUserOrderStore {
                 .await?
             }
             Some(cursor) => {
-                sqlx::query_as::<_, UserOrderRow>(&format!(
+                sqlx::query_as::<_, UserOrderRow>(AssertSqlSafe(format!(
                     "SELECT {USER_ORDER_COLS} FROM user_order \
                      WHERE user_id = ? AND scene = ? AND ( \
                         order_key > ? OR \
@@ -219,7 +219,7 @@ impl IUserOrderStore for SqliteUserOrderStore {
                      ) \
                      ORDER BY order_key ASC, item_type ASC, item_id ASC \
                      LIMIT ?"
-                ))
+                )))
                 .bind(user_id)
                 .bind(scene.as_str())
                 .bind(cursor.order_key)
