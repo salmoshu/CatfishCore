@@ -23,6 +23,16 @@ use crate::ports::{ArchiveTeardownPorts, RemoveProjectPorts};
 const USER: &str = "user-1";
 const OTHER: &str = "user-2";
 
+macro_rules! repo_path {
+    ($name:literal) => {
+        if cfg!(windows) {
+            concat!("C:/repo/", $name)
+        } else {
+            concat!("/repo/", $name)
+        }
+    };
+}
+
 // -- Fixture -----------------------------------------------------------------
 
 struct Fixture {
@@ -248,8 +258,8 @@ async fn classifies_five_cases_for_conversations() {
         USER,
         "proj-std",
         "Std",
-        &canon_of("/repo/std"),
-        &file_uri("/repo/std"),
+        &canon_of(repo_path!("std")),
+        &file_uri(repo_path!("std")),
     )
     .await;
     insert_temp_project(pool, USER, "proj-temp").await;
@@ -259,9 +269,9 @@ async fn classifies_five_cases_for_conversations() {
     // case 2: bound to temp project => chats.
     insert_conv(pool, USER, "c2", Some("proj-temp"), "{}", 90).await;
     // case 3: unbound, workspace canonicalizes onto the standard project root.
-    insert_conv_ws(pool, USER, "c3", "/repo/std", 80).await;
+    insert_conv_ws(pool, USER, "c3", repo_path!("std"), 80).await;
     // case 4: unbound, non-temp path with no matching project => pseudo-dir.
-    insert_conv_ws(pool, USER, "c4", "/repo/other", 70).await;
+    insert_conv_ws(pool, USER, "c4", repo_path!("other"), 70).await;
     // case 5: unbound, temp-session workspace => chats.
     insert_conv_ws(pool, USER, "c5", &fx.temp_workspace("sess-a"), 60).await;
 
@@ -328,11 +338,11 @@ async fn path_merge_does_not_write_the_db() {
         USER,
         "proj-std",
         "Std",
-        &canon_of("/repo/std"),
-        &file_uri("/repo/std"),
+        &canon_of(repo_path!("std")),
+        &file_uri(repo_path!("std")),
     )
     .await;
-    insert_conv_ws(pool, USER, "c3", "/repo/std", 80).await;
+    insert_conv_ws(pool, USER, "c3", repo_path!("std"), 80).await;
 
     let resp = fx
         .service
@@ -362,13 +372,13 @@ async fn dangling_project_id_falls_through_to_path() {
         USER,
         "proj-std",
         "Std",
-        &canon_of("/repo/std"),
-        &file_uri("/repo/std"),
+        &canon_of(repo_path!("std")),
+        &file_uri(repo_path!("std")),
     )
     .await;
     // project_id points at a project that does not exist -> treat as NULL, then
     // classify by workspace path (which merges onto proj-std).
-    let extra = serde_json::json!({ "workspace": "/repo/std" }).to_string();
+    let extra = serde_json::json!({ "workspace": repo_path!("std") }).to_string();
     insert_conv(pool, USER, "ghost", Some("no-such-proj"), &extra, 80).await;
 
     let resp = fx
@@ -392,8 +402,8 @@ async fn archived_scope_reads_only_archived_without_pinned_or_spine() {
         USER,
         "proj-std",
         "Std",
-        &canon_of("/repo/std"),
-        &file_uri("/repo/std"),
+        &canon_of(repo_path!("std")),
+        &file_uri(repo_path!("std")),
     )
     .await;
     // One active chat (pinned) and one archived chat, both plain (no workspace).
@@ -450,8 +460,8 @@ async fn teams_classify_and_fold_members_orphans_downgrade() {
         USER,
         "proj-std",
         "Std",
-        &canon_of("/repo/std"),
-        &file_uri("/repo/std"),
+        &canon_of(repo_path!("std")),
+        &file_uri(repo_path!("std")),
     )
     .await;
 
@@ -499,7 +509,7 @@ async fn teams_classify_and_fold_members_orphans_downgrade() {
 async fn pinned_item_leaves_its_natural_group() {
     let fx = fixture().await;
     let pool = fx.pool();
-    insert_conv_ws(pool, USER, "c4", "/repo/other", 70).await;
+    insert_conv_ws(pool, USER, "c4", repo_path!("other"), 70).await;
 
     // Before pin: c4 lives in its dir group, no pinned group.
     let before = fx
@@ -539,7 +549,7 @@ async fn pinned_item_leaves_its_natural_group() {
 #[tokio::test]
 async fn pin_unpin_is_idempotent_and_validated() {
     let fx = fixture().await;
-    insert_conv_ws(fx.pool(), USER, "c1", "/repo/other", 70).await;
+    insert_conv_ws(fx.pool(), USER, "c1", repo_path!("other"), 70).await;
 
     // Unknown scene / item_type -> 400, never a silent no-op.
     assert!(matches!(
@@ -686,13 +696,13 @@ async fn first_screen_is_user_scoped() {
         OTHER,
         "proj-foreign",
         "Foreign",
-        &canon_of("/repo/shared"),
-        &file_uri("/repo/shared"),
+        &canon_of(repo_path!("shared")),
+        &file_uri(repo_path!("shared")),
     )
     .await;
     insert_conv(pool, OTHER, "foreign-c", Some("proj-foreign"), "{}", 100).await;
     // USER's own single conversation.
-    insert_conv_ws(pool, USER, "mine", "/repo/mine", 50).await;
+    insert_conv_ws(pool, USER, "mine", repo_path!("mine"), 50).await;
 
     let resp = fx
         .service
@@ -754,7 +764,7 @@ async fn chats_paging_is_continuous_no_dup_no_miss() {
 #[tokio::test]
 async fn items_on_missing_scope_is_scope_gone() {
     let fx = fixture().await;
-    insert_conv_ws(fx.pool(), USER, "c1", "/repo/other", 70).await;
+    insert_conv_ws(fx.pool(), USER, "c1", repo_path!("other"), 70).await;
 
     let err = fx
         .service
@@ -959,17 +969,17 @@ async fn remove_project_deletes_the_visible_construct_and_orphan_rows() {
         USER,
         "proj-std",
         "Std",
-        &canon_of("/repo/std"),
-        &file_uri("/repo/std"),
+        &canon_of(repo_path!("std")),
+        &file_uri(repo_path!("std")),
     )
     .await;
 
     insert_conv(pool, USER, "c1", Some("proj-std"), "{}", 100).await; // bound (case 1)
-    insert_conv_ws(pool, USER, "c3", "/repo/std", 90).await; // path-merged (case 3)
+    insert_conv_ws(pool, USER, "c3", repo_path!("std"), 90).await; // path-merged (case 3)
     insert_team(pool, USER, "T1", "", Some("proj-std"), 200).await; // bound team
     insert_member(pool, USER, "m1", "T1", 150).await;
     insert_member(pool, USER, "m2", "T1", 160).await;
-    insert_conv_ws(pool, USER, "c4", "/repo/other", 70).await; // dir group -> keep
+    insert_conv_ws(pool, USER, "c4", repo_path!("other"), 70).await; // dir group -> keep
     insert_conv_ws(pool, USER, "c5", &fx.temp_workspace("s"), 60).await; // chats -> keep
 
     // Pin a conversation and the team so we can assert orphan cleanup.
@@ -1059,8 +1069,8 @@ async fn remove_project_is_best_effort_on_port_failure() {
         USER,
         "proj-std",
         "Std",
-        &canon_of("/repo/std"),
-        &file_uri("/repo/std"),
+        &canon_of(repo_path!("std")),
+        &file_uri(repo_path!("std")),
     )
     .await;
     insert_conv(pool, USER, "c1", Some("proj-std"), "{}", 100).await;
@@ -1536,16 +1546,16 @@ async fn seed_project_construct(fx: &Fixture) {
         USER,
         "proj-std",
         "Std",
-        &canon_of("/repo/std"),
-        &file_uri("/repo/std"),
+        &canon_of(repo_path!("std")),
+        &file_uri(repo_path!("std")),
     )
     .await;
     insert_conv(pool, USER, "c1", Some("proj-std"), "{}", 100).await; // bound (case 1)
-    insert_conv_ws(pool, USER, "c3", "/repo/std", 90).await; // path-merged (case 3)
+    insert_conv_ws(pool, USER, "c3", repo_path!("std"), 90).await; // path-merged (case 3)
     insert_team(pool, USER, "T1", "", Some("proj-std"), 200).await; // bound team
     insert_member(pool, USER, "m1", "T1", 150).await;
     insert_member(pool, USER, "m2", "T1", 160).await;
-    insert_conv_ws(pool, USER, "c4", "/repo/other", 70).await; // dir group -> keep
+    insert_conv_ws(pool, USER, "c4", repo_path!("other"), 70).await; // dir group -> keep
     insert_conv_ws(pool, USER, "c5", &fx.temp_workspace("s"), 60).await; // chats -> keep
 }
 
@@ -1616,8 +1626,8 @@ async fn archive_project_on_missing_or_nonstandard_scope_is_scope_gone() {
         OTHER,
         "proj-foreign",
         "Foreign",
-        &canon_of("/repo/foreign"),
-        &file_uri("/repo/foreign"),
+        &canon_of(repo_path!("foreign")),
+        &file_uri(repo_path!("foreign")),
     )
     .await;
     insert_conv(pool, OTHER, "fc", Some("proj-foreign"), "{}", 100).await;
