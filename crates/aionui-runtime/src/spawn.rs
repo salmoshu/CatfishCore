@@ -366,6 +366,7 @@ fn resolve_program(program: &OsStr) -> OsString {
 mod tests {
     use super::*;
     use crate::ResolvedCommand;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     #[tokio::test]
@@ -453,14 +454,18 @@ mod tests {
         };
 
         let builder = Builder::from_resolved(&resolved);
-        let preview = builder.to_string();
-        assert!(
-            preview.contains("hello"),
-            "preview should include args prefix: {preview}"
+        let command = builder.inner.as_std();
+        assert_eq!(command.get_args().collect::<Vec<_>>(), [OsStr::new("hello")]);
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new("NO_COLOR"))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("1"))
         );
-        assert!(preview.contains("NO_COLOR=\"1\"") || preview.contains("NO_COLOR=1"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn display_renders_shell_style_command() {
         let mut b = Builder::new("/usr/local/bin/node");

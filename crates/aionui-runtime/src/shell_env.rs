@@ -467,7 +467,10 @@ mod tests {
         std::fs::create_dir_all(home.join(".nvm/versions/node/v22.22.0/bin")).unwrap();
         std::fs::create_dir_all(home.join(".nvm/versions/node/v25.1.0/bin")).unwrap();
 
-        let bins = platform_extra_bins_at(Some(home));
+        let bins: Vec<_> = platform_extra_bins_at(Some(home))
+            .into_iter()
+            .map(|path| PathBuf::from(path.to_string_lossy().replace('\\', "/")))
+            .collect();
 
         // 至少这些目录应出现
         assert!(

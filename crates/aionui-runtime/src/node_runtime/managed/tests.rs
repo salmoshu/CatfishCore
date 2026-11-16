@@ -218,6 +218,7 @@ async fn persistent_npm_version_failure_still_reports_bundled_resource_invalid()
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn managed_runtime_validation_uses_real_commands() {
     let tmp = tempfile::tempdir().unwrap();
@@ -461,11 +462,21 @@ fn managed_runtime_checksum_verification_detects_mismatch() {
 fn managed_runtime_injects_npm_state_under_runtime_root() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("node-v24.11.0-test");
-    let bin = root.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(bin.join("node"), b"").unwrap();
-    std::fs::write(bin.join("npm"), b"").unwrap();
-    std::fs::write(bin.join("npx"), b"").unwrap();
+    #[cfg(windows)]
+    {
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("node.exe"), b"").unwrap();
+        std::fs::write(root.join("npm.cmd"), b"").unwrap();
+        std::fs::write(root.join("npx.cmd"), b"").unwrap();
+    }
+    #[cfg(unix)]
+    {
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("node"), b"").unwrap();
+        std::fs::write(bin.join("npm"), b"").unwrap();
+        std::fs::write(bin.join("npx"), b"").unwrap();
+    }
 
     let runtime = runtime_from_root(&root, ResolvedNodeSource::Managed).expect("runtime");
     let env: std::collections::HashMap<_, _> = runtime

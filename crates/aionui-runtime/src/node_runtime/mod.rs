@@ -480,20 +480,32 @@ mod tests {
     }
 
     fn fake_managed_runtime(root: &std::path::Path) -> ResolvedNodeRuntime {
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).expect("create runtime bin");
-        write_executable(&bin.join("node"), "#!/bin/sh\necho v24.11.0\n");
-        write_executable(&bin.join("npm"), "#!/bin/sh\necho 24.11.0\n");
-        write_executable(&bin.join("npx"), "#!/bin/sh\necho 24.11.0\n");
+        let (node_path, npm_path, npx_path) = if cfg!(windows) {
+            fs::create_dir_all(root).expect("create runtime root");
+            let paths = (root.join("node.exe"), root.join("npm.cmd"), root.join("npx.cmd"));
+            let host_node = crate::resolve_command_path("node").expect("host Node executable for runtime fixture");
+            fs::copy(host_node, &paths.0).expect("copy Node executable into runtime fixture");
+            write_executable(&paths.1, "@echo off\r\necho 24.11.0\r\n");
+            write_executable(&paths.2, "@echo off\r\necho 24.11.0\r\n");
+            paths
+        } else {
+            let bin = root.join("bin");
+            fs::create_dir_all(&bin).expect("create runtime bin");
+            let paths = (bin.join("node"), bin.join("npm"), bin.join("npx"));
+            write_executable(&paths.0, "#!/bin/sh\necho v24.11.0\n");
+            write_executable(&paths.1, "#!/bin/sh\necho 24.11.0\n");
+            write_executable(&paths.2, "#!/bin/sh\necho 24.11.0\n");
+            paths
+        };
 
         ResolvedNodeRuntime {
             source: ResolvedNodeSource::Managed,
             root: root.to_path_buf(),
             version: semver::Version::new(0, 0, 0),
-            node_path: bin.join("node"),
-            npm_path: bin.join("npm"),
+            node_path,
+            npm_path,
             npm_args_prefix: vec![],
-            npx_path: bin.join("npx"),
+            npx_path,
             npx_args_prefix: vec![],
             env: vec![],
         }
