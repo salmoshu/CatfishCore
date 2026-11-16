@@ -17,6 +17,10 @@ fn init_repo(dir: &Path) -> Repository {
     let mut cfg = repo.config().expect("config");
     cfg.set_str("user.name", "scm test").expect("set name");
     cfg.set_str("user.email", "scm@test.local").expect("set email");
+    // Keep these content-restoration fixtures independent of the host's global
+    // checkout conversion; Git itself already covers CRLF conversion behavior.
+    cfg.set_bool("core.autocrlf", false)
+        .expect("disable checkout conversion");
     repo
 }
 

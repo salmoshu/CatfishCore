@@ -1,34 +1,45 @@
 use super::*;
 
+#[cfg(windows)]
+fn uri(path: &str) -> String {
+    let native_path = format!("C:{}", path.replace('/', "\\"));
+    to_file_uri(Path::new(&native_path)).unwrap()
+}
+
+#[cfg(not(windows))]
+fn uri(path: &str) -> String {
+    path.to_owned()
+}
+
 #[test]
 fn drops_trailing_slash() {
     assert_eq!(
-        canonicalize("file:///a/b/").unwrap(),
-        canonicalize("file:///a/b").unwrap()
+        canonicalize(&uri("/a/b/")).unwrap(),
+        canonicalize(&uri("/a/b")).unwrap()
     );
 }
 
 #[test]
 fn resolves_dot_dot_lexically() {
     assert_eq!(
-        canonicalize("file:///a/b/../c").unwrap(),
-        canonicalize("file:///a/c").unwrap()
+        canonicalize(&uri("/a/b/../c")).unwrap(),
+        canonicalize(&uri("/a/c")).unwrap()
     );
 }
 
 #[test]
 fn resolves_single_dot() {
     assert_eq!(
-        canonicalize("file:///a/./b").unwrap(),
-        canonicalize("file:///a/b").unwrap()
+        canonicalize(&uri("/a/./b")).unwrap(),
+        canonicalize(&uri("/a/b")).unwrap()
     );
 }
 
 #[test]
 fn collapses_repeated_separators() {
     assert_eq!(
-        canonicalize("file:///a//b").unwrap(),
-        canonicalize("file:///a/b").unwrap()
+        canonicalize(&uri("/a//b")).unwrap(),
+        canonicalize(&uri("/a/b")).unwrap()
     );
 }
 
@@ -36,26 +47,31 @@ fn collapses_repeated_separators() {
 fn dot_dot_above_root_is_clamped_not_errored() {
     // Lexical clamp to root; containment (not canonicalize) rejects escapes.
     assert_eq!(
-        canonicalize("file:///../../a").unwrap(),
-        canonicalize("file:///a").unwrap()
+        canonicalize(&uri("/../../a")).unwrap(),
+        canonicalize(&uri("/a")).unwrap()
     );
 }
 
 #[test]
 fn is_deterministic() {
-    let a = canonicalize("file:///Users/me/proj").unwrap();
-    let b = canonicalize("file:///Users/me/proj").unwrap();
+    let a = canonicalize(&uri("/Users/me/proj")).unwrap();
+    let b = canonicalize(&uri("/Users/me/proj")).unwrap();
     assert_eq!(a, b);
 }
 
 #[test]
 fn casing_folds_per_platform() {
-    let mixed = canonicalize("file:///Users/Me/Aion").unwrap();
-    let lower = canonicalize("file:///users/me/aion").unwrap();
+    let mixed = canonicalize(&uri("/Users/Me/Aion")).unwrap();
+    let lower = canonicalize(&uri("/users/me/aion")).unwrap();
     if IGNORE_PATH_CASING {
         // macOS / Windows: same folder.
         assert_eq!(mixed, lower);
-        assert_eq!(mixed.as_str(), "file:///users/me/aion");
+        let expected = if cfg!(windows) {
+            "file:///C:/users/me/aion"
+        } else {
+            "file:///users/me/aion"
+        };
+        assert_eq!(mixed.as_str(), expected);
     } else {
         // Linux: two distinct folders.
         assert_ne!(mixed, lower);
@@ -66,8 +82,8 @@ fn casing_folds_per_platform() {
 fn symlink_dir_is_not_its_target_lexically() {
     // Pure lexical identity: two distinct path strings are two distinct
     // folders regardless of any on-disk symlink relationship.
-    let link = canonicalize("file:///a/link").unwrap();
-    let target = canonicalize("file:///a/target").unwrap();
+    let link = canonicalize(&uri("/a/link")).unwrap();
+    let target = canonicalize(&uri("/a/target")).unwrap();
     assert_ne!(link, target);
 }
 
@@ -88,13 +104,13 @@ fn parse_scheme_accepts_file_rejects_others() {
 
 #[test]
 fn basename_is_final_segment() {
-    let c = canonicalize("file:///Users/me/aion").unwrap();
+    let c = canonicalize(&uri("/Users/me/aion")).unwrap();
     assert_eq!(basename(&c), "aion");
 }
 
 #[test]
 fn fs_path_roundtrips_canonical() {
-    let c = canonicalize("file:///Users/me/aion").unwrap();
+    let c = canonicalize(&uri("/Users/me/aion")).unwrap();
     let p = fs_path(&c).unwrap();
     // Re-deriving the file uri from the path reproduces the canonical string.
     assert_eq!(to_file_uri(&p).unwrap(), c.as_str());
@@ -103,6 +119,16 @@ fn fs_path_roundtrips_canonical() {
 #[test]
 fn to_file_uri_does_not_fold_casing() {
     // to_file_uri is raw capture, not identity: casing is preserved.
-    let uri = to_file_uri(std::path::Path::new("/Users/Me/Aion")).unwrap();
-    assert_eq!(uri, "file:///Users/Me/Aion");
+    let path = if cfg!(windows) {
+        r"C:\Users\Me\Aion"
+    } else {
+        "/Users/Me/Aion"
+    };
+    let expected = if cfg!(windows) {
+        "file:///C:/Users/Me/Aion"
+    } else {
+        "file:///Users/Me/Aion"
+    };
+    let uri = to_file_uri(Path::new(path)).unwrap();
+    assert_eq!(uri, expected);
 }

@@ -2,22 +2,31 @@ use super::*;
 use crate::canonical::canonicalize;
 
 fn root() -> Canonical {
-    canonicalize("file:///work/proj").unwrap()
+    #[cfg(windows)]
+    let uri = canonical::to_file_uri(Path::new(r"C:\work\proj")).unwrap();
+    #[cfg(not(windows))]
+    let uri = "file:///work/proj".to_owned();
+    canonicalize(&uri).unwrap()
 }
 
 #[test]
 fn resolves_normal_child_path() {
-    let r = resolve_relative(&root(), "src/main.rs", FileOp::Read).unwrap();
+    let root = root();
+    let r = resolve_relative(&root, "src/main.rs", FileOp::Read).unwrap();
     assert_eq!(r.relative_path, "src/main.rs");
-    assert_eq!(r.resource_uri, "file:///work/proj/src/main.rs");
-    assert_eq!(r.absolute_path.unwrap().to_string_lossy(), "/work/proj/src/main.rs");
+    assert_eq!(r.resource_uri, format!("{}/src/main.rs", root.as_str()));
+    assert_eq!(
+        r.absolute_path.unwrap(),
+        canonical::fs_path(&root).unwrap().join("src/main.rs")
+    );
 }
 
 #[test]
 fn empty_relative_is_root_itself() {
-    let r = resolve_relative(&root(), "", FileOp::Browse).unwrap();
+    let root = root();
+    let r = resolve_relative(&root, "", FileOp::Browse).unwrap();
     assert_eq!(r.relative_path, "");
-    assert_eq!(r.resource_uri, "file:///work/proj");
+    assert_eq!(r.resource_uri, root.as_str());
 }
 
 #[test]
