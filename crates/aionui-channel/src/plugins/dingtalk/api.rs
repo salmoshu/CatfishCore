@@ -348,19 +348,19 @@ mod tests {
     fn token_cache_expired() {
         let cache = TokenCache {
             token: "test".into(),
-            acquired_at: Instant::now() - Duration::from_secs(7200),
-            expires_in: Duration::from_secs(7200),
+            acquired_at: Instant::now(),
+            expires_in: Duration::ZERO,
         };
         assert!(cache.is_expired());
     }
 
     #[test]
     fn token_cache_near_expiry() {
-        // Token acquired 6900s ago with 7200s TTL — within 5min margin
+        // Reaching the refresh margin must refresh the token on every platform.
         let cache = TokenCache {
             token: "test".into(),
-            acquired_at: Instant::now() - Duration::from_secs(6900),
-            expires_in: Duration::from_secs(7200),
+            acquired_at: Instant::now(),
+            expires_in: TOKEN_REFRESH_MARGIN,
         };
         assert!(cache.is_expired());
     }
