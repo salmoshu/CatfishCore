@@ -15,19 +15,31 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create a shell script at `dir/path` with the given body and make it executable.
-fn write_script(dir: &Path, rel_path: &str, body: &str) {
-    let full = dir.join(rel_path);
+/// Create a platform-native hook script and return its relative path.
+#[cfg(unix)]
+fn write_script(dir: &Path, stem: &str, body: &str, _windows_body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rel_path = format!("{stem}.sh");
+    let full = dir.join(&rel_path);
     if let Some(parent) = full.parent() {
         fs::create_dir_all(parent).unwrap();
     }
-    let content = format!("#!/bin/sh\n{body}\n");
-    fs::write(&full, content).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&full, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&full, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&full, fs::Permissions::from_mode(0o755)).unwrap();
+    rel_path
+}
+
+/// Create a platform-native hook script and return its relative path.
+#[cfg(windows)]
+fn write_script(dir: &Path, stem: &str, _unix_body: &str, body: &str) -> String {
+    let rel_path = format!("{stem}.ps1");
+    let full = dir.join(&rel_path);
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent).unwrap();
     }
+    fs::write(&full, format!("{body}\r\n")).unwrap();
+    rel_path
 }
 
 fn setup_ext_dir() -> TempDir {
@@ -42,14 +54,15 @@ fn setup_ext_dir() -> TempDir {
 async fn lh1_first_install_executes_on_install() {
     let dir = setup_ext_dir();
     let marker = dir.path().join("installed.marker");
-    write_script(
+    let install_hook = write_script(
         dir.path(),
-        "scripts/install.sh",
+        "scripts/install",
         &format!("touch '{}'", marker.display()),
+        &format!("[IO.File]::WriteAllText('{}', '')", marker.display()),
     );
 
     let hooks = LifecycleHooks {
-        on_install: Some("scripts/install.sh".into()),
+        on_install: Some(install_hook),
         ..Default::default()
     };
 
@@ -70,14 +83,15 @@ async fn lh1_first_install_executes_on_install() {
 async fn lh2_version_change_executes_on_install() {
     let dir = setup_ext_dir();
     let marker = dir.path().join("upgraded.marker");
-    write_script(
+    let install_hook = write_script(
         dir.path(),
-        "scripts/install.sh",
+        "scripts/install",
         &format!("touch '{}'", marker.display()),
+        &format!("[IO.File]::WriteAllText('{}', '')", marker.display()),
     );
 
     let hooks = LifecycleHooks {
-        on_install: Some("scripts/install.sh".into()),
+        on_install: Some(install_hook),
         ..Default::default()
     };
 
@@ -108,14 +122,15 @@ async fn lh3_activate_executes_on_activate() {
     let dir = setup_ext_dir();
     let counter_file = dir.path().join("activate_count.txt");
     // Append a line on each activation to count calls
-    write_script(
+    let activate_hook = write_script(
         dir.path(),
-        "scripts/activate.sh",
+        "scripts/activate",
         &format!("echo 'activated' >> '{}'", counter_file.display()),
+        &format!("Add-Content -Path '{}' -Value 'activated'", counter_file.display()),
     );
 
     let hooks = LifecycleHooks {
-        on_activate: Some("scripts/activate.sh".into()),
+        on_activate: Some(activate_hook),
         ..Default::default()
     };
 
@@ -142,14 +157,15 @@ async fn lh3_activate_executes_on_activate() {
 async fn lh4_deactivate_executes_on_deactivate() {
     let dir = setup_ext_dir();
     let marker = dir.path().join("deactivated.marker");
-    write_script(
+    let deactivate_hook = write_script(
         dir.path(),
-        "scripts/deactivate.sh",
+        "scripts/deactivate",
         &format!("touch '{}'", marker.display()),
+        &format!("[IO.File]::WriteAllText('{}', '')", marker.display()),
     );
 
     let hooks = LifecycleHooks {
-        on_deactivate: Some("scripts/deactivate.sh".into()),
+        on_deactivate: Some(deactivate_hook),
         ..Default::default()
     };
 
@@ -167,20 +183,17 @@ async fn lh4_deactivate_executes_on_deactivate() {
 async fn lh5_hook_timeout() {
     let dir = setup_ext_dir();
     // Script that sleeps for a long time
-    write_script(dir.path(), "scripts/slow.sh", "sleep 120");
+    let slow_hook = write_script(dir.path(), "scripts/slow", "sleep 120", "Start-Sleep -Seconds 120");
 
     // We can't easily override the built-in timeout constants in the public API,
     // so we test the timeout mechanism by using tokio::time::timeout directly
     // to simulate what execute_hook does internally with a very short deadline.
-    let script_path = dir.path().join("scripts/slow.sh");
+    let script_path = dir.path().join(slow_hook);
     assert!(script_path.exists());
 
-    let child_future = tokio::process::Command::new(&script_path)
-        .current_dir(dir.path())
-        .kill_on_drop(true)
-        .output();
-
-    let result = tokio::time::timeout(std::time::Duration::from_millis(200), child_future).await;
+    let mut command = aionui_runtime::Builder::clean_cli(&script_path);
+    command.current_dir(dir.path());
+    let result = tokio::time::timeout(std::time::Duration::from_millis(200), command.output()).await;
     assert!(result.is_err(), "should time out before script completes");
 }
 
@@ -219,10 +232,10 @@ async fn lh6_missing_script_graceful() {
 #[test]
 fn resolve_hook_path_none_when_not_declared() {
     let hooks = LifecycleHooks::default();
-    assert!(resolve_hook_path(&hooks, HookKind::OnInstall).is_none());
-    assert!(resolve_hook_path(&hooks, HookKind::OnUninstall).is_none());
-    assert!(resolve_hook_path(&hooks, HookKind::OnActivate).is_none());
-    assert!(resolve_hook_path(&hooks, HookKind::OnDeactivate).is_none());
+    assert_eq!(resolve_hook_path(&hooks, HookKind::OnInstall), None);
+    assert_eq!(resolve_hook_path(&hooks, HookKind::OnUninstall), None);
+    assert_eq!(resolve_hook_path(&hooks, HookKind::OnActivate), None);
+    assert_eq!(resolve_hook_path(&hooks, HookKind::OnDeactivate), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,9 +245,14 @@ fn resolve_hook_path_none_when_not_declared() {
 #[tokio::test]
 async fn hook_nonzero_exit_returns_hook_failed() {
     let dir = setup_ext_dir();
-    write_script(dir.path(), "scripts/fail.sh", "echo 'setup failed' >&2; exit 42");
+    let fail_hook = write_script(
+        dir.path(),
+        "scripts/fail",
+        "echo 'setup failed' >&2; exit 42",
+        "[Console]::Error.WriteLine('setup failed')\nexit 42",
+    );
 
-    let result = execute_hook(dir.path(), "scripts/fail.sh", HookKind::OnInstall, "failing-ext").await;
+    let result = execute_hook(dir.path(), &fail_hook, HookKind::OnInstall, "failing-ext").await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -259,9 +277,14 @@ async fn hook_nonzero_exit_returns_hook_failed() {
 #[tokio::test]
 async fn hook_working_directory_is_ext_dir() {
     let dir = setup_ext_dir();
-    write_script(dir.path(), "check_dir.sh", "pwd > cwd_out.txt");
+    let cwd_hook = write_script(
+        dir.path(),
+        "check_dir",
+        "pwd > cwd_out.txt",
+        "[IO.File]::WriteAllText('cwd_out.txt', $PWD.Path)",
+    );
 
-    let result = execute_hook(dir.path(), "check_dir.sh", HookKind::OnActivate, "cwd-ext").await;
+    let result = execute_hook(dir.path(), &cwd_hook, HookKind::OnActivate, "cwd-ext").await;
     assert!(result.is_ok());
 
     let cwd_file = dir.path().join("cwd_out.txt");

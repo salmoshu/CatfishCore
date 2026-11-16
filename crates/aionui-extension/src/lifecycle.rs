@@ -169,7 +169,24 @@ pub fn needs_install_hook(current_version: &str, persisted_version: Option<&str>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::process::Command;
+
+    #[cfg(unix)]
+    fn write_hook_script(dir: &Path, stem: &str, body: &str, _windows_body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let name = format!("{stem}.sh");
+        let path = dir.join(&name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        name
+    }
+
+    #[cfg(windows)]
+    fn write_hook_script(dir: &Path, stem: &str, _unix_body: &str, body: &str) -> String {
+        let name = format!("{stem}.ps1");
+        std::fs::write(dir.join(&name), format!("{body}\r\n")).unwrap();
+        name
+    }
 
     // -----------------------------------------------------------------------
     // needs_install_hook
@@ -267,16 +284,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_hook_success() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("hook.sh");
-        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let script = write_hook_script(dir.path(), "hook", "exit 0", "exit 0");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let result = execute_hook(dir.path(), "hook.sh", HookKind::OnActivate, "test-ext").await;
+        let result = execute_hook(dir.path(), &script, HookKind::OnActivate, "test-ext").await;
 
         assert!(result.is_ok());
     }
@@ -284,16 +294,14 @@ mod tests {
     #[tokio::test]
     async fn test_execute_hook_nonzero_exit() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("fail.sh");
-        std::fs::write(&script_path, "#!/bin/sh\necho 'something broke' >&2\nexit 1\n").unwrap();
+        let script = write_hook_script(
+            dir.path(),
+            "fail",
+            "echo 'something broke' >&2\nexit 1",
+            "[Console]::Error.WriteLine('something broke')\nexit 1",
+        );
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let result = execute_hook(dir.path(), "fail.sh", HookKind::OnInstall, "test-ext").await;
+        let result = execute_hook(dir.path(), &script, HookKind::OnInstall, "test-ext").await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -313,26 +321,13 @@ mod tests {
     #[tokio::test]
     async fn test_execute_hook_timeout() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("slow.sh");
-        // Script that sleeps longer than we allow
-        std::fs::write(&script_path, "#!/bin/sh\nsleep 60\n").unwrap();
+        let script = write_hook_script(dir.path(), "slow", "sleep 60", "Start-Sleep -Seconds 60");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        // Use a very short timeout override via a direct timeout wrapper
+        // Use a very short timeout override via a direct timeout wrapper.
         let ext_dir = dir.path().to_owned();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            Command::new(ext_dir.join("slow.sh"))
-                .current_dir(&ext_dir)
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await;
+        let mut command = CmdBuilder::clean_cli(ext_dir.join(script));
+        command.current_dir(&ext_dir);
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), command.output()).await;
 
         assert!(result.is_err(), "should have timed out");
     }
@@ -341,17 +336,14 @@ mod tests {
     async fn test_execute_hook_working_directory() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("cwd_marker.txt");
-        let script_path = dir.path().join("check_cwd.sh");
-        // Write cwd to a file so we can verify it
-        std::fs::write(&script_path, "#!/bin/sh\npwd > cwd_marker.txt\n").unwrap();
+        let script = write_hook_script(
+            dir.path(),
+            "check_cwd",
+            "pwd > cwd_marker.txt",
+            "[IO.File]::WriteAllText('cwd_marker.txt', $PWD.Path)",
+        );
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let result = execute_hook(dir.path(), "check_cwd.sh", HookKind::OnActivate, "test-ext").await;
+        let result = execute_hook(dir.path(), &script, HookKind::OnActivate, "test-ext").await;
 
         assert!(result.is_ok());
         assert!(marker.exists());
