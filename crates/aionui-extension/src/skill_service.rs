@@ -1050,6 +1050,27 @@ async fn replace_existing_path(path: &Path) -> Result<(), ExtensionError> {
         Err(e) => return Err(e.into()),
     };
 
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let attributes = metadata.file_attributes();
+        if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 && attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            // A dangling junction is reported as a symlink rather than a directory.
+            // Clear the reparse point before removing its local entry, without touching the target.
+            let path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                junction::delete(&path)?;
+                std::fs::remove_dir(path)
+            })
+            .await
+            .map_err(|e| ExtensionError::Io(io::Error::other(format!("junction::delete join error: {e}"))))??;
+            return Ok(());
+        }
+    }
+
     if metadata.file_type().is_symlink() || metadata.is_file() {
         tokio::fs::remove_file(path).await?;
     } else {
@@ -2732,7 +2753,12 @@ mod tests {
 
         let outcome = import_skills(&paths, &fresh_source).await.unwrap();
 
-        assert_eq!(outcome.imported, vec!["dangling"]);
+        assert_eq!(
+            outcome.imported,
+            vec!["dangling"],
+            "import failures: {:?}",
+            outcome.failed
+        );
         assert!(outcome.failed.is_empty());
         assert!(!target.is_symlink());
         assert!(target.join(SKILL_MANIFEST_FILE).exists());
