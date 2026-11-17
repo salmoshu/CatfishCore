@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.7](https://github.com/salmoshu/CatfishCore/releases/tag/v0.2.7) (2026-11-18)
+
+### Bug Fixes
+
+- **conversation:** wait briefly for trailing ACP terminal registration or visible output before diagnosing an empty reply, without replaying user instructions
+
 ## [0.2.6](https://github.com/salmoshu/CatfishCore/releases/tag/v0.2.6) (2026-11-16)
 
 ### Bug Fixes

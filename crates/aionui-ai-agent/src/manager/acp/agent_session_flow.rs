@@ -365,7 +365,14 @@ impl AcpAgentManager {
         // `probe_rx` was subscribed just before this prompt and is drained here,
         // the signal is correlated strictly to the turn/near-window — signals
         // seen earlier in the session lifetime are never attributed here.
-        let observations = drain_turn_observations(&mut probe_rx);
+        let initial_observations = drain_turn_observations(&mut probe_rx);
+        let observations = settle_empty_turn_observations(
+            &mut probe_rx,
+            initial_observations,
+            || crate::agent_task::IAgentTask::live_background_tasks(self),
+            EMPTY_TURN_HANDOFF_GRACE_PERIOD,
+        )
+        .await;
         let live_background_tasks = crate::agent_task::IAgentTask::live_background_tasks(self);
         if observations.empty && live_background_tasks > 0 {
             tracing::info!(
@@ -581,6 +588,52 @@ fn drain_turn_observations(rx: &mut tokio::sync::broadcast::Receiver<AgentStream
     TurnObservations { empty, dialect_signal }
 }
 
+const EMPTY_TURN_HANDOFF_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(1500);
+const EMPTY_TURN_HANDOFF_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// An ACP prompt reply and its trailing stream notifications are independent.
+/// Give an otherwise-empty turn a bounded opportunity to expose its terminal or
+/// other visible activity before persisting a misleading empty-reply diagnosis.
+/// The receiver is the only stream consumed here; no prompt is ever replayed.
+async fn settle_empty_turn_observations(
+    rx: &mut tokio::sync::broadcast::Receiver<AgentStreamEvent>,
+    mut observations: TurnObservations,
+    live_background_tasks: impl Fn() -> usize,
+    grace_period: std::time::Duration,
+) -> TurnObservations {
+    if !observations.empty {
+        return observations;
+    }
+
+    let deadline = tokio::time::Instant::now() + grace_period;
+    loop {
+        if live_background_tasks() > 0 {
+            return observations;
+        }
+
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(AgentStreamEvent::AcpDialectSignal(_)) => observations.dialect_signal = true,
+                    Ok(event) => {
+                        if event_is_user_visible_output(&event) {
+                            observations.empty = false;
+                            return observations;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        observations.empty = false;
+                        return observations;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return observations,
+                }
+            }
+            _ = tokio::time::sleep(EMPTY_TURN_HANDOFF_POLL_INTERVAL) => {}
+            _ = tokio::time::sleep_until(deadline) => return observations,
+        }
+    }
+}
+
 fn should_diagnose_empty_turn(observed_empty: bool, live_background_tasks: usize) -> bool {
     observed_empty && live_background_tasks == 0
 }
@@ -598,6 +651,7 @@ fn event_is_user_visible_output(event: &AgentStreamEvent) -> bool {
             | AgentStreamEvent::Plan(_)
             | AgentStreamEvent::Permission(_)
             | AgentStreamEvent::AcpPermission(_)
+            | AgentStreamEvent::AcpTerminalOutput(_)
     )
 }
 
@@ -1342,6 +1396,81 @@ mod tests {
             super::PromptOutcome::Completed { session_id } if session_id == "sess-1"
         ));
         assert!(super::should_diagnose_empty_turn(true, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_turn_observes_background_terminal_registered_after_prompt_reply() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let background = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let background_later = std::sync::Arc::clone(&background);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            background_later.store(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let _keep_stream_open = tx;
+
+        let observations = super::settle_empty_turn_observations(
+            &mut rx,
+            super::TurnObservations {
+                empty: true,
+                dialect_signal: false,
+            },
+            || background.load(std::sync::atomic::Ordering::Relaxed),
+            std::time::Duration::from_millis(250),
+        )
+        .await;
+
+        assert!(observations.empty);
+        assert!(!super::should_diagnose_empty_turn(
+            observations.empty,
+            background.load(std::sync::atomic::Ordering::Relaxed)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_turn_observes_late_terminal_output() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tx.send(crate::protocol::events::AgentStreamEvent::AcpTerminalOutput(
+                serde_json::json!({ "terminal_id": "terminal-1", "output": "running" }),
+            ))
+            .unwrap();
+        });
+
+        let observations = super::settle_empty_turn_observations(
+            &mut rx,
+            super::TurnObservations {
+                empty: true,
+                dialect_signal: false,
+            },
+            || 0,
+            std::time::Duration::from_millis(250),
+        )
+        .await;
+
+        assert!(!observations.empty);
+        assert!(!super::should_diagnose_empty_turn(observations.empty, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_turn_still_diagnoses_when_no_activity_arrives_within_grace_period() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<crate::protocol::events::AgentStreamEvent>(8);
+        let _keep_stream_open = tx;
+
+        let observations = super::settle_empty_turn_observations(
+            &mut rx,
+            super::TurnObservations {
+                empty: true,
+                dialect_signal: false,
+            },
+            || 0,
+            std::time::Duration::from_millis(250),
+        )
+        .await;
+
+        assert!(observations.empty);
+        assert!(super::should_diagnose_empty_turn(observations.empty, 0));
     }
 
     #[test]
