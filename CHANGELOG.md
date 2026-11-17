@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.8](https://github.com/salmoshu/CatfishCore/releases/tag/v0.2.8) (2026-11-18)
+
+### Bug Fixes
+
+- **release:** run Intel macOS build jobs on the matching `macos-15-intel` runner
+
 ## [0.2.7](https://github.com/salmoshu/CatfishCore/releases/tag/v0.2.7) (2026-11-18)
 
 ### Bug Fixes
