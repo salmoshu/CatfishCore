@@ -58,7 +58,7 @@ jobs:
         with:
           prefix-key: v1-rust
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace
+      - run: cargo nextest run --workspace --no-fail-fast
 
   changes:
     name: Detect dependency changes

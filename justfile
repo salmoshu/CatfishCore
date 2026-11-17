@@ -36,9 +36,14 @@ build-debug *FLAGS:
 install: build
     @{{install_script}} release
 
-# Run all tests
+# Run only affected crates or filters during development
+# Example: just test-affected -p aionui-project -p aionui-db
+test-affected *ARGS:
+    @just _cargo nextest run {{ARGS}}
+
+# Run all tests and collect every failure in one diagnostic pass
 test:
-    @just _cargo nextest run --workspace
+    @just _cargo nextest run --workspace --no-fail-fast
 
 # Ensure already-shipped database migrations stay immutable
 migration-check:
@@ -64,8 +69,12 @@ fmt:
 fmt-check:
     @cargo fmt --all -- --check
 
+# Full diagnostic pass: collect all failures without pushing
+# Fix the reported failures and rerun affected tests before the formal push gate.
+diagnose: migration-check lint fmt-check test
+
 # Lint + format check + migration check + test
-check: migration-check lint fmt-check test
+check: diagnose
 
 # Run the server (debug)
 run *ARGS:
@@ -75,7 +84,8 @@ run *ARGS:
 run-release *ARGS:
     @just _cargo run --release --bin aioncore -- {{ARGS}}
 
-# Pre-push gate: migration check, format, lint, auto-commit fixes, test, then push
+# Formal pre-push gate: run only after diagnostics and affected tests pass
+# Never use this as a failure-discovery command during development.
 push *ARGS: migration-check lint-fix fmt _auto-commit-fixes test
     git push {{ARGS}}
 

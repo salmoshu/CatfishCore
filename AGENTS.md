@@ -261,6 +261,14 @@ cargo test -p aionui-<crate1> -p aionui-<crate2>                               #
 
 ### Before Push (full workspace)
 
+Run one full diagnostic pass and fix all reported failures before the formal push gate:
+
 ```bash
-just push                                             # full pre-push gate, then push
+just diagnose   # migration + lint + format + all tests; collects every test failure
+just push       # formal pre-push gate, then push; do not use this to discover failures
 ```
+
+- Run `just test-affected -p aionui-<crate>` after each targeted fix instead of rerunning the full workspace.
+- Run long tests and static checks in the background and continue with independent work; use completion notifications rather than foreground `sleep` or process-wait polling.
+- Do not run CPU-heavy Cargo tests, frontend tests, and Electron packaging concurrently on the same machine when resource contention could invalidate timing-sensitive tests.
+- Added requirements extend the affected-crate list; they do not justify repeating unrelated gates that have already passed for an unchanged commit.
